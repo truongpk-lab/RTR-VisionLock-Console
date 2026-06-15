@@ -1,0 +1,36 @@
+# Python
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+backend/.pytest_cache/
+
+# Frontend / Electron
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Runtime data
+backend/logs/*.jsonl
+backend/runtime/*
+!backend/runtime/.gitkeep
+backend/models/*
+!backend/models/.gitkeep
+backend/assets/sample_videos/*
+!backend/assets/sample_videos/.gitkeep
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment files
+.env
+.env.*
+*.local

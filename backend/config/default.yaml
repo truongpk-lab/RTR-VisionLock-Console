@@ -1,0 +1,81 @@
+app:
+  name: RTR VisionLock Console
+  mode: omni_watch
+
+camera:
+  source: 0
+  width: 1280
+  height: 720
+  fps: 30
+
+models:
+  proposal:
+    type: opencv_contour
+    path: models/fastsam.pt
+    input_size: 640
+    enabled: false
+  segmenter:
+    # Promptable click-to-segment (Segment Anything family). Drop ONNX files in
+    # backend/models/ and set enabled: true to use SAM; otherwise the GrabCut
+    # fallback runs so click-to-select still works without any model download.
+    # Recommended CPU models: MobileSAM or EfficientViT-SAM-L0 (ONNX export).
+    type: mobile_sam_onnx
+    encoder_path: models/mobile_sam_encoder.onnx
+    decoder_path: models/mobile_sam_decoder.onnx
+    input_size: 1024
+    enabled: false
+
+selection:
+  # 'point' = click-to-segment one object (SAM/GrabCut). 'auto' = legacy
+  # multi-candidate proposal + per-candidate mini trackers.
+  mode: point
+  tracker:
+    type: opencv_csrt
+    path: null
+    input_size: 224
+  embedding:
+    type: hsv_histogram
+    path: null
+  text_guided:
+    type: yoloe
+    path: null
+    enabled: false
+
+thresholds:
+  stable_threshold: 0.70
+  uncertain_threshold: 0.45
+  lost_frames: 5
+  reacquire_threshold: 0.75
+  memory_update_threshold: 0.78
+  kalman_max_error: 80
+  min_similarity: 0.55
+  mask_iou_threshold: 0.50
+
+runtime:
+  device: cpu
+  precision: fp32
+  dam_refine_interval: 5
+  max_candidates: 20
+  skip_old_frames: true
+  queue_size: 2
+
+learning:
+  duration_sec: 2.5
+  min_samples: 8
+  max_samples: 20
+  quality_threshold: 80.0
+
+memory:
+  base_id_prefix: TGT
+  feature_dim: 1024
+  ram_slots: 8
+  drm_slots: 8
+  update_method: ema
+  ema_alpha: 0.15
+
+ui:
+  theme: dark
+  show_masks: true
+  show_candidates: true
+  show_kalman_region: false
+  log_max_lines: 500
