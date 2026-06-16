@@ -23,6 +23,10 @@ class SegmentRequest(BaseModel):
     point: dict[str, int] | None = None
 
 
+class BoxRequest(BaseModel):
+    bbox: list[int] | None = None
+
+
 class PromptRequest(BaseModel):
     prompt: str = ""
 
@@ -71,6 +75,11 @@ def segment_target(payload: SegmentRequest | None = None) -> dict[str, Any]:
     return session.segment_target(payload.point if payload else None)
 
 
+@app.post("/api/target/box")
+def select_box(payload: BoxRequest | None = None) -> dict[str, Any]:
+    return session.select_box(payload.bbox if payload else None)
+
+
 @app.post("/api/target/pick")
 def pick_target(payload: LockTargetRequest | None = None) -> dict[str, Any]:
     return session.pick_target(payload.candidate_id if payload else None, payload.point if payload else None)
@@ -112,7 +121,9 @@ async def websocket_session(websocket: WebSocket) -> None:
     try:
         while True:
             await websocket.send_json(session.snapshot(include_frame=True))
-            await asyncio.sleep(0.12)
+            # ~20 Hz: the frame JPEG is already encoded in the capture loop, so a
+            # snapshot just re-reads it — cheap enough to keep selection responsive.
+            await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         return
 

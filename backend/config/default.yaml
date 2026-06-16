@@ -7,34 +7,69 @@ camera:
   width: 1280
   height: 720
   fps: 30
+  # Pixel format requested from the device. MJPG lets a USB webcam stream
+  # compressed at full rate; the uncompressed default (YUYV) caps 720p at a few
+  # FPS and is the usual cause of low capture throughput. Set "" to leave as-is.
+  fourcc: MJPG
+  # Capture runs on its own thread and keeps only the newest frame, so frames
+  # buffered while processing was busy are dropped automatically (flat latency).
 
 models:
   proposal:
-    type: opencv_contour
-    path: models/fastsam.pt
+    # Primary detector for Jetson deployment. Export the fine-tuned YOLO11n
+    # model to TensorRT FP16 at backend/models/yolo11n_custom.engine. If the
+    # engine or optional runtime package is unavailable, the backend falls back
+    # to the OpenCV contour proposer so development machines still run.
+    type: yolo11_trt
+    path: models/yolo11n_custom.engine
     input_size: 640
-    enabled: false
+    conf: 0.35
+    iou: 0.50
+    class_names: []
+    enabled: true
   segmenter:
-    # Promptable click-to-segment (Segment Anything family). Drop ONNX files in
-    # backend/models/ and set enabled: true to use SAM; otherwise the GrabCut
-    # fallback runs so click-to-select still works without any model download.
-    # Recommended CPU models: MobileSAM or EfficientViT-SAM-L0 (ONNX export).
-    type: mobile_sam_onnx
+    # Promptable target refinement. Prefer SAM2.1 Hiera Tiny for Jetson GPU
+    # deployment; fall back to SAM ONNX/GrabCut when optional models are absent.
+    type: sam2
+    checkpoint: models/sam2.1_hiera_tiny.pt
+    model_cfg: configs/sam2.1/sam2.1_hiera_t.yaml
     encoder_path: models/mobile_sam_encoder.onnx
     decoder_path: models/mobile_sam_decoder.onnx
     input_size: 1024
-    enabled: false
+    enabled: true
+  # Tier A normal tracker: UETrack (CVPR 2026). Prefer the S/T (small/tiny)
+  # variant exported to TensorRT for the >=60 FPS target on Jetson AGX (the B
+  # variant is more accurate but heavier). Clone the repo on-device, point
+  # repo_path at it, and verify the exact variant/param name in the fork. Missing
+  # torch/repo/weights => the backbone reports unavailable and falls back to OpenCV.
+  tracker_uetrack:
+    enabled: true
+    repo_path: ""                  # absolute path to the cloned UETrack repo
+    checkpoint: models/uetrack_t.pth
+    param_module: lib.test.parameter.uetrack
+    tracker_module: lib.test.tracker.uetrack
+    tracker_class: UETrack
+    param_name: uetrack_t          # S/T variant for >=60 FPS (was uetrack_b)
+  # Tier B re-find tracker: EVPTrack-224 (AAAI 2024) spatio-temporal visual prompts.
+  tracker_evptrack:
+    enabled: true
+    repo_path: ""                  # absolute path to the cloned EVPTrack repo
+    checkpoint: models/evptrack.pth
+    param_module: lib.test.parameter.evptrack
+    tracker_module: lib.test.tracker.evptrack
+    tracker_class: EVPTrack
+    param_name: baseline           # EVPTrack-224 (input 224) for speed
 
 selection:
-  # 'point' = click-to-segment one object (SAM/GrabCut). 'auto' = legacy
-  # multi-candidate proposal + per-candidate mini trackers.
-  mode: point
+  # YOLO-first selection is the default: detector boxes are shown first, then
+  # the selected box is refined by SAM2/SAM/GrabCut before learning starts.
+  mode: yolo
   tracker:
     type: opencv_csrt
     path: null
     input_size: 224
   embedding:
-    type: hsv_histogram
+    type: hsv_shape
     path: null
   text_guided:
     type: yoloe
@@ -50,14 +85,116 @@ thresholds:
   kalman_max_error: 80
   min_similarity: 0.55
   mask_iou_threshold: 0.50
+  # Motion-consistency above this is treated as "calm" for adaptive SAM2 refine.
+  stable_motion: 0.70
 
 runtime:
-  device: cpu
-  precision: fp32
-  dam_refine_interval: 5
+  device: cuda
+  precision: fp16
+  detector_interval: 5
+  # After lock the detector is OFF (run only by global re-detect when LOST). SAM2
+  # mask refine during live tracking is OFF by default too (init-only) to protect
+  # the >=60 FPS budget and avoid a second algorithm fighting the tracker.
+  refine_during_tracking: false
+  sam_refine_interval: 8
+  # Adaptive SAM2 refine: when Kalman motion is calm we stretch the refine cadence
+  # to stable_refine_interval; under shaky motion we fall back to sam_refine_interval.
+  adaptive_refine: true
+  stable_refine_interval: 30
+  max_sam_candidates: 3
   max_candidates: 20
+  # Cap live mini-trackers during candidate selection and refresh boxes by
+  # re-detecting periodically instead of running one tracker per candidate/frame.
+  max_candidate_trackers: 6
+  candidate_redetect_interval: 15
+  # Stream a downscaled JPEG to the UI (processing stays full-res).
+  stream_max_width: 960
+  stream_jpeg_quality: 70
   skip_old_frames: true
   queue_size: 2
+
+tracking:
+  # 3-tier confidence-gated tracking layer (LTMU-style meta-updater), see
+  # app/vision/policy.py. Each tier's backbone is selected by name from
+  # app/vision/backbones and falls back to OpenCV when a deep engine is absent,
+  # so a dev box without torch still runs end-to-end.
+  #   confidence HIGH -> normal_backbone   (Tier A, fast local track)
+  #   confidence LOW  -> refind_backbone   (Tier B, local re-find)
+  #   target LOST     -> global YOLO+ReID re-detect (Tier C, reacquire_threshold)
+  normal_backbone: uetrack
+  refind_backbone: evptrack
+  # Consecutive sub-stable (but not lost) frames before handing A -> B. Higher =
+  # more patient on the strong tracker before switching to the re-find tracker.
+  refind_after: 2
+
+motion:
+  # Camera ego-motion compensation: sparse LK optical flow on background features
+  # (target masked out) feeds a global (tx,ty) into the EKF gate so camera
+  # shake/pan is not mistaken for target drift. Pure cv2 CPU; enabled:false
+  # restores the plain constant-velocity behaviour. See app/vision/flow.py + ekf.py.
+  camera:
+    enabled: true
+    flow_downscale: 0.5            # run flow at half resolution (cheaper)
+    max_features: 200             # goodFeaturesToTrack cap
+    flow_interval: 1              # compute flow every Nth tracking frame
+    feature_quality: 0.01
+    feature_min_distance: 8
+    target_mask_margin: 0.2       # dilate target bbox before excluding it from flow
+    min_inliers: 12               # below this -> ok=false (gate falls back)
+    lk_win: 21
+  ekf:
+    q_pos: 1.0                    # process noise: center position
+    q_vel: 4.0                    # process noise: center velocity (target maneuver)
+    q_size: 0.5                   # process noise: w/h random walk
+    r_pos: 4.0                    # measurement noise: center
+    r_size: 9.0                   # measurement noise: w/h
+
+sam2:
+  video_memory_window: 16
+  negative_prompt_radius: 2.5
+
+samurai:
+  # SAMURAI motion-aware tracking (https://github.com/yangchris11/samurai).
+  # use_video_predictor turns on the streaming SAM2 video backbone (needs a
+  # streaming-capable SAM2 build + GPU); OFF falls back to the OpenCV backbone
+  # with SAM2 used only for periodic refine. Verify on-device before enabling.
+  use_video_predictor: false
+  # alpha_kf weights Kalman-motion agreement vs raw mask affinity when SAM2 emits
+  # multiple masks; distractor_penalty subtracts overlap with known negatives.
+  alpha_kf: 0.25
+  distractor_penalty: 0.25
+  memory_admission:
+    # Motion-aware memory selection: a frame is written to the appearance bank
+    # only if it clears every gate, so a passing look-alike cannot poison the lock.
+    min_affinity: 0.50
+    min_positive: 0.60
+    max_negative: 0.50
+    min_motion: 0.50
+    min_margin: 0.10
+
+identity:
+  # Pluggable appearance encoder (see app/vision/encoders.py). Default is a
+  # handcrafted spatial-colour + texture feature that separates similar objects
+  # far better than a global histogram, still CPU-only/Jetson-cheap. Use
+  # encoder: hsv_shape for the original lighter global histogram.
+  encoder: hsv_block_texture
+  min_margin: 0.12
+  negative_slots: 8
+
+reacquire:
+  identity_weight: 0.45
+  motion_weight: 0.25
+  detector_weight: 0.15
+  mask_weight: 0.15
+  # Global re-detection (Tier C) runs only when LOST, at low frequency, and must
+  # confirm a candidate over several consecutive, spatially-consistent frames
+  # (matched to the long-term anchor) before re-locking — no single-frame flapping.
+  detect_hz: 3                  # global detector cadence while LOST (2-5 Hz)
+  confirm_frames: 3             # consecutive confirmations required before re-lock
+  confirm_iou_gate: 0.3         # spatial consistency between confirmation frames
+  confirm_max_gap: 1            # tolerated misses without losing the streak
+  learn_distractors: true       # add rejected look-alikes to the negative bank
+  distractor_min_score: 0.5     # min detector score to bother learning a distractor
 
 learning:
   duration_sec: 2.5
@@ -67,9 +204,16 @@ learning:
 
 memory:
   base_id_prefix: TGT
-  feature_dim: 1024
+  feature_dim: 1026
+  # Three positive tiers (see app/vision/memory.py): ram=short-term (every
+  # admitted STABLE frame), wrm=working-term (periodic promotion), drm=long-term
+  # identity ANCHOR (seeded at lock, consolidated rarely; global Re-ID matches it).
   ram_slots: 8
+  wrm_slots: 8
   drm_slots: 8
+  negative_slots: 8
+  working_promote_every: 12      # admitted frames between working-tier promotions
+  long_term_min_margin: 0.25     # stricter gate to consolidate into the anchor
   update_method: ema
   ema_alpha: 0.15
 

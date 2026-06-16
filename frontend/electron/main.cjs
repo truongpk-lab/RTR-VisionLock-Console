@@ -38,9 +38,14 @@ function findFreePort() {
 }
 
 function backendPython() {
-  // Prefer the project venv; fall back to the system interpreter.
-  const venvPy = path.join(backendDir, ".venv", "Scripts", "python.exe");
-  return require("fs").existsSync(venvPy) ? venvPy : "python";
+  // Prefer the project venv; support both Windows and POSIX layouts.
+  const fs = require("fs");
+  const candidates = [
+    path.join(backendDir, ".venv", "Scripts", "python.exe"),
+    path.join(backendDir, ".venv", "bin", "python"),
+    path.join(backendDir, ".venv", "bin", "python3"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || "python";
 }
 
 function startBackend(port) {

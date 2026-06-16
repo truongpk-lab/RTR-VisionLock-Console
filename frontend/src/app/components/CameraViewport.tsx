@@ -7,10 +7,18 @@ export function CameraViewport() {
   const [frame, setFrame] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
-  const { connected, session, pickTarget, segmentTarget } = useTrackingSession();
+  const { connected, session, pickTarget, segmentTarget, selectBox } = useTrackingSession();
   const trackingState = session.state;
   const pointPrompt = trackingState === "POINT_PROMPT";
-  const selecting = pointPrompt || trackingState === "CANDIDATE_TRACKING" || trackingState === "TARGET_SELECTION";
+  const selecting =
+    connected &&
+    (pointPrompt ||
+      trackingState === "CANDIDATE_TRACKING" ||
+      trackingState === "TARGET_SELECTION" ||
+      trackingState === "CAMERA_READY");
+  // Rubber-band box (viewport CSS px) drawn while the operator drags a target.
+  const [dragBox, setDragBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const dragOrigin = useRef<{ cx: number; cy: number } | null>(null);
 
   // Animate kalman prediction slightly
   useEffect(() => {
@@ -55,27 +63,76 @@ export function CameraViewport() {
     ? `data:image/jpeg;base64,${session.frame}`
     : "https://images.unsplash.com/photo-1472146936668-d987bf0a6e38?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZXJpYWwlMjBjaXR5JTIwaW50ZXJzZWN0aW9uJTIwbmlnaHQlMjBkcm9uZXxlbnwxfHx8fDE3ODE1MDQ1NTd8MA&ixlib=rb-4.1.0&q=80&w=1080";
 
-  function handleViewportClick(event: MouseEvent<HTMLDivElement>) {
-    if (!connected || !selecting) return;
+  function toFrameCoords(clientX: number, clientY: number, rect: DOMRect) {
+    const [frameWidth, frameHeight] = session.frame_size;
+    return {
+      x: Math.round(((clientX - rect.left) / rect.width) * frameWidth),
+      y: Math.round(((clientY - rect.top) / rect.height) * frameHeight),
+    };
+  }
+
+  function handleMouseDown(event: MouseEvent<HTMLDivElement>) {
+    if (!connected || !selecting || event.button !== 0) return;
+    if ((event.target as HTMLElement).closest("button")) return; // let UI buttons work
+    const rect = event.currentTarget.getBoundingClientRect();
+    dragOrigin.current = { cx: event.clientX, cy: event.clientY };
+    const lx = event.clientX - rect.left;
+    const ly = event.clientY - rect.top;
+    setDragBox({ x0: lx, y0: ly, x1: lx, y1: ly });
+  }
+
+  function handleMouseMove(event: MouseEvent<HTMLDivElement>) {
+    if (!dragOrigin.current) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    setDragBox((box) =>
+      box ? { ...box, x1: event.clientX - rect.left, y1: event.clientY - rect.top } : box,
+    );
+  }
+
+  function handleMouseUp(event: MouseEvent<HTMLDivElement>) {
+    const origin = dragOrigin.current;
+    dragOrigin.current = null;
+    setDragBox(null);
+    if (!connected || !selecting || !origin) return;
     const [frameWidth, frameHeight] = session.frame_size;
     if (!frameWidth || !frameHeight) return;
     const rect = event.currentTarget.getBoundingClientRect();
-    const x = Math.round(((event.clientX - rect.left) / rect.width) * frameWidth);
-    const y = Math.round(((event.clientY - rect.top) / rect.height) * frameHeight);
-    if (pointPrompt) {
-      // Click-to-segment: SAM/GrabCut returns one object box at the click.
-      segmentTarget({ x, y });
-    } else {
-      // Legacy auto mode: click a moving candidate box to pick it.
-      pickTarget(undefined, { x, y });
+    const moved = Math.hypot(event.clientX - origin.cx, event.clientY - origin.cy);
+
+    if (moved > 6) {
+      // Drag = single-object-tracking init: learn the boxed region directly,
+      // independent of the detector (works even when YOLO is unavailable).
+      const a = toFrameCoords(Math.min(origin.cx, event.clientX), Math.min(origin.cy, event.clientY), rect);
+      const b = toFrameCoords(Math.max(origin.cx, event.clientX), Math.max(origin.cy, event.clientY), rect);
+      selectBox([a.x, a.y, b.x - a.x, b.y - a.y]);
+      return;
     }
+
+    // Plain click: pick the candidate under the cursor, else segment that point.
+    const p = toFrameCoords(event.clientX, event.clientY, rect);
+    const hit = session.candidate_boxes.find(
+      (c) => p.x >= c.bbox[0] && p.x <= c.bbox[0] + c.bbox[2] && p.y >= c.bbox[1] && p.y <= c.bbox[1] + c.bbox[3],
+    );
+    if (hit && !pointPrompt) {
+      pickTarget(hit.id);
+    } else {
+      segmentTarget(p);
+    }
+  }
+
+  function handleMouseLeave() {
+    dragOrigin.current = null;
+    setDragBox(null);
   }
 
   return (
     <div
       ref={viewportRef}
       className={`absolute inset-0 w-full h-full bg-black ${selecting ? "cursor-crosshair" : ""}`}
-      onClick={handleViewportClick}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseLeave}
     >
       {/* Background Video/Image Feed */}
       <img
@@ -99,6 +156,19 @@ export function CameraViewport() {
       {/* Overlays based on state */}
       {hasLiveFrame && (
         <LiveOverlays session={session} />
+      )}
+
+      {/* Rubber-band selection box while dragging a target */}
+      {dragBox && (
+        <div
+          className="absolute z-20 border-2 border-amber-400 bg-amber-400/15 pointer-events-none"
+          style={{
+            left: Math.min(dragBox.x0, dragBox.x1),
+            top: Math.min(dragBox.y0, dragBox.y1),
+            width: Math.abs(dragBox.x1 - dragBox.x0),
+            height: Math.abs(dragBox.y1 - dragBox.y0),
+          }}
+        />
       )}
 
       {!hasLiveFrame && trackingState === "STABLE" && (
@@ -142,12 +212,12 @@ export function CameraViewport() {
          ) : trackingState === "POINT_PROMPT" ? (
            <div className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/50 text-cyan-300 font-mono text-xs uppercase tracking-widest flex items-center gap-2 rounded-sm backdrop-blur-sm">
              <span className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse"></span>
-             CLICK OBJECT · {session.segmenter.model_ready ? "SAM" : "GRABCUT"}
+             CLICK OBJECT · {session.segmenter.backend.toUpperCase()}
            </div>
          ) : trackingState === "CANDIDATE_TRACKING" ? (
            <div className="px-3 py-1 bg-cyan-500/20 border border-cyan-500/50 text-cyan-300 font-mono text-xs uppercase tracking-widest flex items-center gap-2 rounded-sm backdrop-blur-sm">
              <span className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse"></span>
-             CLICK A TARGET
+             DRAG BOX / CLICK · {session.proposal.backend.toUpperCase()}
            </div>
          ) : trackingState === "LEARNING_TARGET" ? (
            <div className="px-3 py-1 bg-emerald-500/20 border border-emerald-500/50 text-emerald-300 font-mono text-xs uppercase tracking-widest flex items-center gap-2 rounded-sm backdrop-blur-sm">
@@ -190,12 +260,17 @@ function LiveOverlays({ session }: { session: ReturnType<typeof useTrackingSessi
         <div
           key={candidate.id}
           className={`absolute border border-dashed ${
-            session.selected_candidate_id === candidate.id ? "border-amber-400 bg-amber-400/20" : "border-cyan-400/60 bg-cyan-400/10"
+            candidate.is_distractor
+              ? "border-rose-400/80 bg-rose-400/10"
+              : candidate.refined || session.selected_candidate_id === candidate.id
+                ? "border-amber-400 bg-amber-400/20"
+                : "border-cyan-400/60 bg-cyan-400/10"
           }`}
           style={toStyle(candidate.bbox)}
         >
           <div className="absolute -top-4 left-0 bg-slate-900/90 text-cyan-300 text-[8px] font-mono px-1">
-            {candidate.id}: {(candidate.reid_score ?? candidate.score).toFixed(2)}
+            {candidate.track_id || candidate.id} {candidate.class_name || "object"}:{" "}
+            {(candidate.reid_score ?? candidate.identity_score ?? candidate.mask_quality ?? candidate.score).toFixed(2)}
           </div>
         </div>
       ))}

@@ -57,8 +57,20 @@ export function RightPanelMetrics() {
             <span className="text-cyan-400">{memory.feature_dim.toLocaleString()}-dim</span>
           </div>
           <div className="flex justify-between items-center text-[10px] font-mono">
-            <span className="text-slate-500">Memory Bank:</span>
-            <span className="text-slate-300">{memory.ram_slots} / {memory.ram_capacity} slots</span>
+            <span className="text-slate-500">Identity Backend:</span>
+            <span className="text-cyan-400">{memory.identity_backend || "hsv_shape"}</span>
+          </div>
+          <div className="flex justify-between items-center text-[10px] font-mono">
+            <span className="text-slate-500">Positive Bank:</span>
+            <span className="text-slate-300">{memory.positive_slots ?? memory.ram_slots + memory.drm_slots} slots</span>
+          </div>
+          <div className="flex justify-between items-center text-[10px] font-mono">
+            <span className="text-slate-500">Negative Bank:</span>
+            <span className="text-slate-300">{memory.negative_slots ?? 0} / {memory.negative_capacity ?? 8} slots</span>
+          </div>
+          <div className="flex justify-between items-center text-[10px] font-mono">
+            <span className="text-slate-500">ID Margin:</span>
+            <span className="text-slate-300">{(memory.identity_margin ?? 0).toFixed(2)}</span>
           </div>
         </div>
       </div>

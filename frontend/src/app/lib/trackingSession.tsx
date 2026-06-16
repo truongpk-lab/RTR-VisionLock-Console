@@ -21,11 +21,21 @@ export type TrackingState =
 
 export interface CandidateBox {
   id: string;
+  track_id?: string;
   bbox: [number, number, number, number];
   score: number;
+  class_id?: number | null;
+  class_name?: string;
+  source?: "yolo" | "opencv";
+  refined?: boolean;
+  mask_quality?: number;
+  identity_score?: number;
+  negative_margin?: number;
   similarity?: number;
   motion?: number;
+  motion_score?: number;
   reid_score?: number;
+  is_distractor?: boolean;
 }
 
 export interface SessionMetrics {
@@ -65,9 +75,22 @@ export interface SessionSnapshot {
     elapsed: number;
     duration: number;
   };
+  proposal: {
+    backend: string;
+    model_ready: boolean;
+    path?: string;
+    input_size?: number;
+    conf?: number;
+    iou?: number;
+    last_error?: string;
+  };
   segmenter: {
     backend: string;
     model_ready: boolean;
+    checkpoint?: string;
+    refine_interval?: number;
+    video_memory_window?: number;
+    last_error?: string;
   };
   metrics: SessionMetrics;
   memory: {
@@ -77,6 +100,11 @@ export interface SessionSnapshot {
     ram_capacity: number;
     drm_slots: number;
     drm_capacity: number;
+    positive_slots?: number;
+    negative_slots?: number;
+    negative_capacity?: number;
+    identity_backend?: string;
+    identity_margin?: number;
     ram_enabled: boolean;
     drm_enabled: boolean;
   };
@@ -92,6 +120,7 @@ interface TrackingContextValue {
   stopCamera: () => Promise<void>;
   selectTarget: () => Promise<void>;
   segmentTarget: (point: { x: number; y: number }) => Promise<void>;
+  selectBox: (bbox: [number, number, number, number]) => Promise<void>;
   pickTarget: (candidateId?: string, point?: { x: number; y: number }) => Promise<void>;
   lockTarget: (candidateId?: string, point?: { x: number; y: number }) => Promise<void>;
   resetTracking: () => Promise<void>;
@@ -123,7 +152,8 @@ const fallbackSession: SessionSnapshot = {
   candidate_boxes: [],
   selected_candidate_id: null,
   learning: { active: false, samples: 0, elapsed: 0, duration: 2.5 },
-  segmenter: { backend: "grabcut", model_ready: false },
+  proposal: { backend: "opencv", model_ready: false },
+  segmenter: { backend: "grabcut", model_ready: false, checkpoint: "", refine_interval: 8 },
   metrics: emptyMetrics,
   memory: {
     base_id: "TGT-8842-A",
@@ -132,6 +162,11 @@ const fallbackSession: SessionSnapshot = {
     ram_capacity: 8,
     drm_slots: 0,
     drm_capacity: 8,
+    positive_slots: 0,
+    negative_slots: 0,
+    negative_capacity: 8,
+    identity_backend: "hsv_shape",
+    identity_margin: 0,
     ram_enabled: true,
     drm_enabled: true,
   },
@@ -202,6 +237,8 @@ export function TrackingSessionProvider({ children }: { children: ReactNode }) {
       selectTarget: async () => refreshFromAction(await apiPost("/api/target/select")),
       segmentTarget: async (point: { x: number; y: number }) =>
         refreshFromAction(await apiPost("/api/target/segment", { point })),
+      selectBox: async (bbox: [number, number, number, number]) =>
+        refreshFromAction(await apiPost("/api/target/box", { bbox })),
       pickTarget: async (candidateId?: string, point?: { x: number; y: number }) =>
         refreshFromAction(await apiPost("/api/target/pick", { candidate_id: candidateId, point })),
       lockTarget: async (candidateId?: string, point?: { x: number; y: number }) =>

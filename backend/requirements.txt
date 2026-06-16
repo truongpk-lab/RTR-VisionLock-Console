@@ -7,3 +7,8 @@ pydantic==2.13.4
 PyYAML==6.0.2
 pytest==8.3.4
 httpx==0.28.1
+
+# Optional Jetson deployment packages:
+# - ultralytics: loads YOLO11 TensorRT .engine exports.
+# - torch + sam2: enables SAM2.1 box-prompt refinement.
+# Keep them out of the base install so desktop fallback/dev stays lightweight.
