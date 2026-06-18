@@ -1,9 +1,12 @@
-"""Optional streaming SAM2 video-predictor backbone.
+"""Streaming SAM2 backbone (SAMURAI-style real-time tracking).
 
-Streams frames through SAM2's video predictor so SAM2's own cross-frame memory
-attention carries the lock — the closest match to upstream SAMURAI. Needs a
-streaming-capable SAM2 build + GPU, so it is OFF by default and any failure flips
-``available`` off so :class:`ManagedTracker` falls back to OpenCV.
+Streams frames through SAM2's per-frame memory attention so the lock is carried
+by SAM2's own cross-frame memory — the closest drop-in to upstream SAMURAI for a
+live camera. Uses the real-time *camera predictor* API
+(``build_sam2_camera_predictor`` / ``load_first_frame`` / ``add_new_prompt`` /
+``track``) from the streaming SAM2 build; falls back to the offline video
+predictor API if only that is present. Any failure (no package / no checkpoint /
+no GPU op) flips ``available`` off so :class:`ManagedTracker` drops to OpenCV.
 """
 
 from __future__ import annotations
@@ -18,7 +21,12 @@ try:
 except Exception:  # pragma: no cover - optional deployment dependency
     torch = None
 
-try:  # Streaming video predictor is only present in newer SAM2 builds.
+try:  # Real-time streaming predictor (segment-anything-2-real-time / SAMURAI).
+    from sam2.build_sam import build_sam2_camera_predictor
+except Exception:  # pragma: no cover - optional deployment dependency
+    build_sam2_camera_predictor = None
+
+try:  # Offline video predictor (vanilla Meta SAM2) — used only as a fallback.
     from sam2.build_sam import build_sam2_video_predictor
 except Exception:  # pragma: no cover - optional deployment dependency
     build_sam2_video_predictor = None
@@ -36,12 +44,13 @@ class Sam2VideoBackbone:
         self.last_error = ""
         self.predictor = None
         self.state = None
+        self._streaming = False  # True -> camera predictor (per-frame track(img))
         self._frame_idx = 0
         self.kind = "sam2_video"
 
         seg_cfg = config.get("models", {}).get("segmenter", {})
-        if build_sam2_video_predictor is None or torch is None:
-            self.last_error = "sam2 video predictor / torch not installed"
+        if torch is None or (build_sam2_camera_predictor is None and build_sam2_video_predictor is None):
+            self.last_error = "sam2 streaming predictor / torch not installed"
             return
         backend_root = Path(__file__).resolve().parents[3]
         checkpoint = backend_root / str(seg_cfg.get("checkpoint", ""))
@@ -53,7 +62,22 @@ class Sam2VideoBackbone:
             device = str(config.get("runtime", {}).get("device", "cuda"))
             if device == "cuda" and not torch.cuda.is_available():
                 device = "cpu"
-            self.predictor = build_sam2_video_predictor(model_cfg, str(checkpoint), device=device)
+            # Lower the SAM2 input size for real-time on modest GPUs: 1024 (default)
+            # is ~4-5 FPS on a laptop 4060; 512 is ~25-30 FPS with little accuracy
+            # loss for a single box-prompted target. 0 keeps the model default.
+            stream_size = int(seg_cfg.get("stream_image_size", 512))
+            overrides = [f"++model.image_size={stream_size}"] if stream_size else []
+            if build_sam2_camera_predictor is not None:
+                self.predictor = build_sam2_camera_predictor(
+                    model_cfg, str(checkpoint), device=device, hydra_overrides_extra=overrides
+                )
+                self._streaming = True
+                self.kind = f"sam2_camera@{stream_size}" if stream_size else "sam2_camera"
+            else:
+                self.predictor = build_sam2_video_predictor(
+                    model_cfg, str(checkpoint), device=device, hydra_overrides_extra=overrides
+                )
+                self.kind = f"sam2_video@{stream_size}" if stream_size else "sam2_video"
             self.available = True
         except Exception as exc:  # pragma: no cover - depends on deployment runtime
             self.predictor = None
@@ -66,13 +90,18 @@ class Sam2VideoBackbone:
             height, width = frame.shape[:2]
             x, y, w, h = clamp_bbox(bbox, width, height)
             box = np.array([x, y, x + w, y + h], dtype=np.float32)
-            # Streaming init: feed the first frame and the box prompt. The exact
-            # call names can vary across SAM2 builds; guarded so failure -> fallback.
+            self._frame_idx = 0
+            if self._streaming:
+                # Real-time camera predictor: feed the first frame, then the box prompt.
+                self.predictor.load_first_frame(frame)
+                self.predictor.add_new_prompt(frame_idx=0, obj_id=1, bbox=box)
+                self.state = True
+                return True
+            # Offline video predictor fallback.
             self.state = self.predictor.init_state_from_frame(frame) if hasattr(
                 self.predictor, "init_state_from_frame"
             ) else self.predictor.init_state(frame)
             self.predictor.add_new_points_or_box(self.state, frame_idx=0, obj_id=1, box=box)
-            self._frame_idx = 0
             return True
         except Exception as exc:  # pragma: no cover - depends on deployment runtime
             self.last_error = str(exc)
@@ -84,8 +113,11 @@ class Sam2VideoBackbone:
             return TrackResult(False, None, 0.0, self.source)
         try:
             self._frame_idx += 1
-            obj_ids, mask_logits = self.predictor.track(self.state, frame)
-            mask = (mask_logits[0] > 0.0)
+            if self._streaming:
+                _obj_ids, mask_logits = self.predictor.track(frame)
+            else:
+                _obj_ids, mask_logits = self.predictor.track(self.state, frame)
+            mask = mask_logits[0] > 0.0
             if hasattr(mask, "cpu"):
                 mask = mask.cpu().numpy()
             mask = np.asarray(mask).squeeze().astype(bool)

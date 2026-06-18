@@ -59,8 +59,31 @@ class MemoryBank:
         self.drm: deque[np.ndarray] = deque(maxlen=self.drm_slots)
         self.negative: deque[np.ndarray] = deque(maxlen=self.negative_slots)
 
-    def extract(self, frame: np.ndarray, bbox: BBox) -> np.ndarray | None:
-        return self.encoder.extract(frame, bbox)
+    def configure(self, config: dict[str, Any]) -> None:
+        """Apply config-tunable thresholds and bank sizes live (Memory Config UI).
+
+        Threshold/margin changes take effect immediately. Slot-count changes resize
+        the banks in place WITHOUT dropping already-learned features, so it is safe
+        even while a target is locked. The encoder itself is not swapped here (that
+        would invalidate stored features) — an encoder change applies on next lock.
+        """
+        memory_cfg = config.get("memory", {})
+        identity_cfg = config.get("identity", {})
+        self.min_margin = float(identity_cfg.get("min_margin", self.min_margin))
+        self.long_term_min_margin = float(memory_cfg.get("long_term_min_margin", self.long_term_min_margin))
+        self.working_promote_every = max(1, int(memory_cfg.get("working_promote_every", self.working_promote_every)))
+        self.admission = AdmissionThresholds.from_config(config)
+        self.ram_slots = int(memory_cfg.get("ram_slots", self.ram_slots))
+        self.wrm_slots = int(memory_cfg.get("wrm_slots", self.wrm_slots))
+        self.drm_slots = int(memory_cfg.get("drm_slots", self.drm_slots))
+        self.negative_slots = int(identity_cfg.get("negative_slots", memory_cfg.get("negative_slots", self.negative_slots)))
+        self.ram = deque(self.ram, maxlen=self.ram_slots)
+        self.wrm = deque(self.wrm, maxlen=self.wrm_slots)
+        self.drm = deque(self.drm, maxlen=self.drm_slots)
+        self.negative = deque(self.negative, maxlen=self.negative_slots)
+
+    def extract(self, frame: np.ndarray, bbox: BBox, mask: np.ndarray | None = None) -> np.ndarray | None:
+        return self.encoder.extract(frame, bbox, mask)
 
     def initialize(self, frame: np.ndarray, bbox: BBox) -> bool:
         feature = self.extract(frame, bbox)

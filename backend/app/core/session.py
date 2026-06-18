@@ -11,7 +11,9 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-from app.core.config import deep_merge, load_config
+import yaml
+
+from app.core.config import LOCAL_CONFIG, deep_merge, load_config
 from app.core.logger import SessionLogger
 from app.core.metrics import MetricState, clamp, track_score
 from app.core.states import TrackingState
@@ -60,6 +62,9 @@ class TrackingSession:
         self.frame_jpeg = ""
         self.target_bbox: BBox | None = None
         self.kalman_bbox: BBox | None = None
+        # SAM2 mask outline of the locked target during LEARNING_TARGET (colour fill
+        # in the UI). Cleared at lock so SAM2 is off while UETrack tracks (box only).
+        self.target_mask: list | None = None
         self.candidates: list[dict] = []
         self.selected_candidate_id: str | None = None
         self.target_class_id: int | None = None
@@ -82,6 +87,17 @@ class TrackingSession:
         self._last_frame_at = 0.0
         self._last_loop_at = 0.0
         self._frame_count = 0
+        # Wall-clock of when the current loss began (monotonic). Drives dynamic
+        # re-acquire weights; None means "not lost". Set lazily in _run_reacquire,
+        # cleared on every (re)lock and teardown.
+        self._lost_since: float | None = None
+        # Lightweight debug telemetry surfaced in snapshot()["debug"] so the UI can
+        # show WHY the system locked/rejected (which engine, identity vs negative,
+        # loss age, ego-motion quality). Filled during the tracking/reacquire loop.
+        self._proposal_source = "none"
+        self._last_identity: dict | None = None
+        self._reacquire_score = 0.0
+        self._ego_motion: Any = None
         self.log("Core", "INFO", "RTR VisionLock backend initialized.")
 
     def log(self, module: str, level: str, message: str, **extra: Any) -> None:
@@ -99,6 +115,23 @@ class TrackingSession:
         """Tier B backbone (default EVPTrack; falls back to OpenCV when absent)."""
         name = self.config.get("tracking", {}).get("refind_backbone", "evptrack")
         return ManagedTracker(self.config, backbone=name)
+
+    def _log_tracker_backend(self, tracker: ManagedTracker, tier: str) -> None:
+        """Surface which engine actually drives the lock; warn on silent fallback.
+
+        A deep backbone (UETrack/EVPTrack) that cannot load drops to OpenCV
+        transparently. That must be visible, otherwise the operator trusts a
+        weak tracker thinking the deep one is running.
+        """
+        if tracker.is_fallback:
+            self.log(
+                "Tracker",
+                "WARN",
+                f"Requested {tracker.requested} ({tier}) unavailable; running OpenCV fallback. "
+                "Accuracy / re-acquire will be limited.",
+            )
+        else:
+            self.log("Tracker", "INFO", f"{tier} tracker: {tracker.source} ({tracker.kind}).")
 
     def start_camera(self, source: int | str | None = None) -> dict:
         with self._lock:
@@ -135,6 +168,8 @@ class TrackingSession:
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
+            self._lost_since = None
+            self._last_identity = None
             self._last_good_bbox = None
             self.log("Camera", "INFO", "Camera stopped.")
             return self.snapshot(include_frame=False)
@@ -158,6 +193,7 @@ class TrackingSession:
             self._spawn_candidate_trackers(latest_frame, candidates)
             self.learning_tracker = None
             self.target_bbox = None
+            self.target_mask = None
             self.kalman_bbox = None
             self.state = TrackingState.CANDIDATE_TRACKING
             proposal_status = self.proposal.to_dict() if hasattr(self.proposal, "to_dict") else {"backend": "unknown"}
@@ -233,11 +269,13 @@ class TrackingSession:
         negative_boxes = self._distractor_boxes(bbox)
         for negative in negative_boxes:
             self.memory.update_negative(self.frame, negative)
+        self.target_mask = None
         refined = self.segmenter.refine_box(self.frame, bbox, positive_point=positive_point, negative_boxes=negative_boxes)
         if refined is not None:
             bbox = clamp_bbox(refined.bbox, width, height)
             self.metrics.mask_iou = refined.quality
             self._mark_selected_candidate_refined(bbox, refined.quality)
+            self.target_mask = refined.polygon  # SAM2 outline coloured during learning
             if refined.refined:
                 self.log("Proposal", "INFO", f"Selected box refined via {refined.backend}.", mask_quality=round(refined.quality, 3))
         # Accurate tracker dedicated to the chosen target for the learning window.
@@ -268,6 +306,8 @@ class TrackingSession:
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
+            self._lost_since = None
+            self._last_identity = None
             self._last_good_bbox = None
             self.target_bbox = None
             self.kalman_bbox = None
@@ -307,9 +347,21 @@ class TrackingSession:
             self.kalman.max_error = float(self.config.get("thresholds", {}).get("kalman_max_error", 80))
             self.confidence.configure(self.config)
             self.reacq.configure(self.config)
+            self.memory.configure(self.config)
             self.camera_motion = CameraMotionEstimator(self.config)
             self.log("Core", "INFO", "Runtime config patched.")
             return self.config
+
+    def save_config(self) -> dict[str, Any]:
+        """Persist the current (tuned) config to config/local.yaml so it survives
+        a restart. local.yaml overrides default.yaml; delete it to revert."""
+        with self._lock:
+            with LOCAL_CONFIG.open("w", encoding="utf-8") as handle:
+                handle.write("# Saved from RTR VisionLock Console (Model Settings > Save).\n")
+                handle.write("# Overrides config/default.yaml. Edit or delete this file to revert.\n")
+                yaml.safe_dump(self.config, handle, sort_keys=False, default_flow_style=False, allow_unicode=True)
+            self.log("Core", "INFO", f"Config saved to {LOCAL_CONFIG.name}.")
+            return {"saved": str(LOCAL_CONFIG)}
 
     def _normalize_candidate(self, candidate: dict, idx: int) -> dict:
         item = dict(candidate)
@@ -326,6 +378,7 @@ class TrackingSession:
         item.setdefault("negative_margin", 0.0)
         item.setdefault("motion_score", 0.0)
         item.setdefault("is_distractor", False)
+        item.setdefault("mask_polygon", None)
         return item
 
     def _positive_point_for_selection(self, bbox: BBox, point: dict | None) -> tuple[int, int]:
@@ -368,6 +421,21 @@ class TrackingSession:
         if selected is None:
             selected = {"id": "__selected__", "bbox": list(selected_bbox), "class_id": None, "class_name": "object"}
         return self._candidate_distractor_boxes(selected, self.candidates)
+
+    def _filter_by_target_class(self, detections: list[dict]) -> list[dict]:
+        """Keep only detections of the locked target's class for global re-detect.
+
+        "Find that label again": when the detector is labelled and the target class
+        was recorded at lock, narrow re-detection to that class so look-alikes of
+        other classes are never ranked. Falls back to all detections when the class
+        is unknown or no same-class candidate is present (so it never gets stuck).
+        """
+        if not self.config.get("reacquire", {}).get("match_label", True):
+            return detections
+        if self.target_class_id is None or not detections:
+            return detections
+        same = [d for d in detections if d.get("class_id") == self.target_class_id]
+        return same if same else detections
 
     def _enrich_candidates(self, frame, candidates: list[dict]) -> list[dict]:
         enriched = [self._normalize_candidate(candidate, idx) for idx, candidate in enumerate(candidates)]
@@ -423,6 +491,12 @@ class TrackingSession:
 
     def _loop(self) -> None:
         self._last_loop_at = time.perf_counter()
+        # Decouple JPEG encode from the processing loop: the UI consumes only ~20Hz,
+        # so encoding every processed frame wastes CPU. stream_max_hz caps the encode
+        # rate (0 = encode every frame, the portable default -> unchanged behaviour).
+        max_hz = float(self.config.get("runtime", {}).get("stream_max_hz", 0))
+        encode_interval = 1.0 / max_hz if max_hz > 0 else 0.0
+        self._last_encode_at = 0.0
         while not self._stop.is_set() and self.camera.active:
             ok, frame = self.camera.read()
             if not ok or frame is None:
@@ -437,8 +511,10 @@ class TrackingSession:
             with self._lock:
                 self.frame = frame
                 self._dispatch_frame(frame)
-                self._encode_frame(frame)
                 now = time.perf_counter()
+                if now - self._last_encode_at >= encode_interval:
+                    self._encode_frame(frame)
+                    self._last_encode_at = now
                 dt = max(1e-6, now - self._last_loop_at)
                 self._last_loop_at = now
                 self.metrics.fps = 0.85 * self.metrics.fps + 0.15 * (1.0 / dt) if self.metrics.fps else 1.0 / dt
@@ -447,6 +523,7 @@ class TrackingSession:
 
     def _clear_selection_state(self) -> None:
         self.candidate_trackers = {}
+        self.target_mask = None
         self.learning_tracker = None
         self.learning_bbox = None
         self.learning_samples = []
@@ -542,7 +619,21 @@ class TrackingSession:
         if len(self.learning_samples) < max_samples:
             quality = self._crop_quality(frame, bbox)
             if quality >= quality_threshold or not self.learning_samples:
-                feature = self.memory.extract(frame, bbox)
+                # Periodically refine with SAM2 to get this frame's foreground mask
+                # so the harvested sample excludes the shadow/road inside the box.
+                # Per-frame refine is too heavy (SAM2 set_image), so mask every Nth
+                # sample and learn the in-between ones box-only (mask=None).
+                mask = None
+                refine_every = max(1, int(learn_cfg.get("mask_refine_every", 4)))
+                if self.segmenter.backend == "sam2" and len(self.learning_samples) % refine_every == 0:
+                    seg = self.segmenter.refine_box(
+                        frame,
+                        bbox,
+                        positive_point=tuple(int(v) for v in bbox_center(bbox)),
+                    )
+                    if seg is not None and seg.mask is not None:
+                        mask = seg.mask
+                feature = self.memory.extract(frame, bbox, mask=mask)
                 if feature is not None:
                     self.learning_samples.append(feature)
 
@@ -575,6 +666,7 @@ class TrackingSession:
         self.confidence.on_lock()
         self.reacq.reset()
         self.camera_motion.reset()
+        self._lost_since = None
         self._last_good_bbox = bbox
         self.target_bbox = bbox
         self.kalman.reset(bbox)
@@ -591,9 +683,12 @@ class TrackingSession:
         self.metrics.motion = "STABLE"
         self.learning_tracker = None
         self.learning_samples = []
+        self.target_mask = None  # SAM2 off after lock: UETrack tracks with box only
+        self._proposal_source = "learning"
         self.state = TrackingState.LOCKED_TRACKING
         self.log("Core", "SUCCESS", "Target locked. State -> LOCKED_TRACKING.")
-        self.log("Tracker", "INFO", f"Main tracker initialized ({self.tracker.kind}).")
+        self._log_tracker_backend(self.tracker, "Tier A normal")
+        self._log_tracker_backend(self.refind_tracker, "Tier B re-find")
 
     def _update_tracking(self, frame) -> None:
         if self.state not in {
@@ -606,14 +701,18 @@ class TrackingSession:
             return
         # Camera ego-motion compensation runs every frame (before update/predict)
         # so the EKF tracks the target independent of camera shake/pan.
-        self.kalman.set_camera_motion(self.camera_motion.estimate(frame, self.target_bbox, self._frame_count))
+        ego = self.camera_motion.estimate(frame, self.target_bbox, self._frame_count)
+        self._ego_motion = ego
+        self.kalman.set_camera_motion(ego)
         # Run ONLY the active tier's local tracker (normal in LOCKED, re-find in
         # UNCERTAIN). Detection stays OFF here; Tier C re-detect handles loss.
         tracker = self.tracker if self.confidence.mode == TrackMode.NORMAL else self.refind_tracker
+        self._proposal_source = "tracker_normal" if self.confidence.mode == TrackMode.NORMAL else "tracker_refind"
         result = tracker.track(frame)
         ok, bbox = result.ok, result.bbox
 
         identity: dict | None = None
+        identity_lost = False
         motion_consistency = 0.0
         mask_quality = 0.0
         if not ok or bbox is None:
@@ -624,15 +723,45 @@ class TrackingSession:
             bbox = clamp_bbox(bbox, width, height)
             error, motion_consistency = self.kalman.update(bbox)
             identity = self.memory.score(frame, bbox)
+            self._last_identity = identity
             similarity = identity["identity_score"]
-            confidence = self._confidence_from_jitter(bbox)
-            # Blend in the backbone's own confidence when it reports one. OpenCV
-            # reports a flat 1.0 (leaves this unchanged); deep trackers report a
-            # real score that should pull confidence down as the target is lost.
-            if result.affinity < 1.0:
-                confidence = 0.5 * confidence + 0.5 * result.affinity
+            stability = self._confidence_from_jitter(bbox)
+            thr = self.config.get("thresholds", {})
+            # Honest tracker confidence. OpenCV fallback reports a flat affinity=1.0
+            # and the jitter-only signal is fooled by SMOOTH drift (the box leans off
+            # target while staying near the Kalman prediction). So when the active
+            # backbone is the OpenCV fallback we estimate confidence from the signals
+            # that actually catch drift -- appearance identity + bbox stability -- and
+            # cap it, since a fallback must not hold STABLE on ok=True alone.
+            if tracker.is_opencv:
+                a = float(thr.get("fallback_identity_weight", 0.6))
+                b = float(thr.get("fallback_stability_weight", 0.4))
+                confidence = clamp(a * similarity + b * stability)
+                confidence = min(confidence, float(thr.get("fallback_confidence_cap", 0.75)))
+            elif result.affinity < 1.0:
+                # Deep tracker reports a real score; let it pull confidence down.
+                confidence = 0.5 * stability + 0.5 * result.affinity
+            else:
+                # No real score (SAM2 mask, or a deep tracker whose fork omits a
+                # score key). Jitter-stability saturates near 1.0 on ANY locally
+                # smooth box -- including a latch onto background/another object --
+                # so cap it: a flat affinity=1.0 must not buy a full-confidence
+                # STABLE on stability alone. Identity still grades the box through
+                # its own term in track_score and the drift-catch below.
+                confidence = min(stability, float(thr.get("flat_confidence_cap", 0.85)))
             mask_quality, refined_bbox = self._maybe_refine_target(frame, bbox, motion_consistency)
-            score = track_score(confidence, similarity, motion_consistency, mask_quality)
+            negative_penalty = float(thr.get("negative_penalty_weight", 0.25)) * identity["negative_similarity"]
+            score = track_score(confidence, similarity, motion_consistency, mask_quality, negative_penalty)
+            # Drift catch: identity is the only signal that reliably tanks under
+            # smooth drift. If it is low while the tracker still says ok, force the
+            # score below STABLE so the FSM drops to UNCERTAIN and memory freezes.
+            if similarity < float(thr.get("min_similarity", 0.55)):
+                score = min(score, float(thr.get("stable_threshold", 0.70)) - 0.01)
+                # Sustained low identity = the tracker is locked onto the wrong
+                # object. The drift-catch only demotes to UNCERTAIN; this flag lets
+                # the policy escalate to LOST after N such frames so global
+                # re-detect can re-find the true target instead of sitting forever.
+                identity_lost = True
             self.target_bbox = refined_bbox or bbox
             self._last_good_bbox = self.target_bbox
             self.kalman_bbox = self.kalman.predict()
@@ -643,7 +772,7 @@ class TrackingSession:
             self.metrics.mask_iou = mask_quality
             self.metrics.track_score = score
 
-        gate = self.confidence.update(score, ok)
+        gate = self.confidence.update(score, ok, identity_lost)
         self._apply_mode_transition(frame, gate.policy, bbox if ok else None)
 
         # Memory bank is tier-gated by the confidence manager: learn only on an
@@ -663,14 +792,31 @@ class TrackingSession:
         if gate.run_detection:
             self._run_reacquire()
 
+    def _widen_search_bbox(self, bbox: BBox, frame) -> BBox:
+        """Enlarge a box around its centre to widen the local re-find search.
+
+        Entering REFIND means the target is slipping; seeding the re-find tracker
+        on a larger region gives it more room to re-capture a target that has moved,
+        before the loss escalates to a full global re-detect.
+        """
+        scale = float(self.config.get("tracking", {}).get("wide_search_scale", 1.5))
+        if scale <= 1.0:
+            return bbox
+        x, y, w, h = bbox
+        cx, cy = x + w / 2.0, y + h / 2.0
+        nw, nh = w * scale, h * scale
+        height, width = frame.shape[:2]
+        return clamp_bbox((int(cx - nw / 2.0), int(cy - nh / 2.0), int(nw), int(nh)), width, height)
+
     def _apply_mode_transition(self, frame, decision, current_bbox: BBox | None) -> None:
         """Swap the active backbone when the policy crosses a tier boundary."""
         if decision.seed_refind:
             seed = current_bbox or self._last_good_bbox or self.kalman.predict()
             if seed is not None:
+                seed = self._widen_search_bbox(seed, frame)
                 self.refind_tracker = self._new_refind_tracker()
                 if self.refind_tracker.init(frame, seed):
-                    self.log("Tracker", "INFO", f"Confidence low -> re-find via {self.refind_tracker.source} (Tier B).")
+                    self.log("Tracker", "INFO", f"Confidence low -> wide re-find via {self.refind_tracker.source} (Tier B).")
         if decision.reinit_normal and self._last_good_bbox is not None:
             self.tracker = self._new_normal_tracker()
             self.tracker.init(frame, self._last_good_bbox)
@@ -743,8 +889,17 @@ class TrackingSession:
         return refined.quality, None
 
     def _reacquire_due(self) -> bool:
-        """Throttle global detection to detect_hz (2-5 Hz) while LOST."""
-        detect_hz = float(self.config.get("reacquire", {}).get("detect_hz", 3))
+        """Throttle global detection to detect_hz (2-5 Hz) while LOST.
+
+        Once the loss is long (> lost_long_sec) the cadence drops to detect_hz_long
+        to save compute -- the target is gone, so scanning every frame buys nothing.
+        """
+        reacq = self.config.get("reacquire", {})
+        detect_hz = float(reacq.get("detect_hz", 3))
+        if self._lost_since is not None:
+            long_sec = float(reacq.get("lost_long_sec", 3.0))
+            if time.monotonic() - self._lost_since >= long_sec:
+                detect_hz = float(reacq.get("detect_hz_long", detect_hz))
         if detect_hz <= 0:
             return True
         fps = self.metrics.fps if self.metrics.fps > 1.0 else 30.0
@@ -756,16 +911,29 @@ class TrackingSession:
             if self.frame is None:
                 return
             self.state = TrackingState.SEARCHING
+            # Hide the target overlay while LOST/searching: drop the last-known box
+            # so the UI stops drawing a frozen box at a stale position. The boxes
+            # are re-populated only on a confirmed re-lock below. Single choke point
+            # for every entry (force, off-tick, not-yet-confirmed). camera_motion is
+            # the only reader of target_bbox and tolerates None; kalman_bbox is read
+            # solely by snapshot().
+            self.target_bbox = None
+            self.kalman_bbox = None
             # Detection runs only on a detect tick; off-tick frames just wait (the
             # confirmation buffer advances per detection tick, not per camera frame).
             if not force and not self._reacquire_due():
                 return
-            candidates = self._enrich_candidates(self.frame, self.proposal.detect(self.frame))
+            detections = self._filter_by_target_class(self.proposal.detect(self.frame))
+            candidates = self._enrich_candidates(self.frame, detections)
             candidates = self._refine_reacquire_candidates(self.frame, candidates)
             candidates = self._enrich_candidates(self.frame, candidates)
             self.candidates = candidates
             self.metrics.candidates = len(candidates)
-            outcome = self.reacq.attempt(self.frame, candidates)
+            if self._lost_since is None:
+                self._lost_since = time.monotonic()
+            lost_age = time.monotonic() - self._lost_since
+            outcome = self.reacq.attempt(self.frame, candidates, lost_age)
+            self._reacquire_score = outcome.reid_score
             if outcome.candidate is not None:
                 self.metrics.similarity = float(outcome.candidate.get("similarity", self.metrics.similarity))
                 self.metrics.confidence = outcome.reid_score
@@ -783,9 +951,11 @@ class TrackingSession:
             self.tracker.init(self.frame, bbox)
             self.refind_tracker = self._new_refind_tracker()
             self.refind_tracker.init(self.frame, bbox)
+            self._log_tracker_backend(self.tracker, "Tier A normal")
             self.confidence.on_lock()
             self.reacq.reset()
             self.camera_motion.reset()
+            self._lost_since = None
             self._last_good_bbox = bbox
             self.target_bbox = bbox
             self.kalman.reset(bbox)
@@ -793,6 +963,7 @@ class TrackingSession:
             self.candidates = []  # detection off again once locked -> clear overlays
             self.metrics.candidates = 0
             self.metrics.track_score = outcome.reid_score
+            self._proposal_source = "reacquire"
             self.log("ReAcquire", "INFO", "Candidate confirmed identity.", candidate=outcome.candidate)
             self.state = TrackingState.REACQUIRED
             self.log("Core", "SUCCESS", "Target re-acquired. State -> LOCKED_TRACKING.")
@@ -857,6 +1028,7 @@ class TrackingSession:
                 "frame_size": list(self.frame.shape[1::-1]) if self.frame is not None else [0, 0],
                 "target_bbox": list(self.target_bbox) if self.target_bbox else None,
                 "kalman_bbox": list(self.kalman_bbox) if self.kalman_bbox else None,
+                "target_mask": self.target_mask,
                 "candidate_boxes": self.candidates,
                 "selected_candidate_id": self.selected_candidate_id,
                 "learning": {
@@ -875,15 +1047,39 @@ class TrackingSession:
                     "confidence_state": self.confidence.confidence_state,
                     "normal_backbone": self.tracker.source,
                     "refind_backbone": self.refind_tracker.source,
+                    "tracker_fallback": self.tracker.is_fallback,
+                    "refind_fallback": self.refind_tracker.is_fallback,
                     "reacquire": {
-                        "confirming": self.reacq.buffer.streak,
+                        "confirming": self.reacq.confirming,
                         "need": self.reacq.confirm_frames,
                         "detect_hz": float(self.config.get("reacquire", {}).get("detect_hz", 3)),
                     },
                 },
                 "metrics": self.metrics.to_dict(),
                 "memory": self.memory.to_dict(),
+                "debug": self._debug_snapshot(),
                 "logs": self.logger.latest(),
                 "timeline": self.timeline[-40:],
                 "prompt": self.prompt,
             }
+
+    def _debug_snapshot(self) -> dict:
+        """Telemetry for the UI/operator: why the system locked or rejected.
+
+        All values are stashed during the loop, so this is a cheap read of already
+        computed signals (no extra detection/scoring).
+        """
+        identity = self._last_identity or {}
+        return {
+            "tracker_backend": self.tracker.source,
+            "tracker_fallback": self.tracker.is_fallback,
+            "refind_backend": self.refind_tracker.source,
+            "refind_fallback": self.refind_tracker.is_fallback,
+            "proposal_source": self._proposal_source,
+            "lost_age_sec": round(time.monotonic() - self._lost_since, 2) if self._lost_since else 0.0,
+            "negative_similarity": float(identity.get("negative_similarity", 0.0)),
+            "positive_negative_margin": float(identity.get("negative_margin", 0.0)),
+            "reacquire_score": round(self._reacquire_score, 3),
+            "ego_motion_ok": bool(getattr(self._ego_motion, "ok", False)),
+            "ego_motion_inlier_ratio": round(float(getattr(self._ego_motion, "inlier_ratio", 0.0)), 3),
+        }

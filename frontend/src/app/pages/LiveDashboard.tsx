@@ -14,7 +14,7 @@ export function LiveDashboard() {
         
         {/* Camera Area */}
         <div className="flex-1 p-4 flex items-center justify-center bg-[#030508] relative overflow-hidden">
-          <div className="w-full max-w-5xl aspect-video relative border border-slate-800 bg-black rounded-sm overflow-hidden shadow-[0_0_20px_rgba(0,0,0,0.5)]">
+          <div className="w-full h-full relative border border-slate-800 bg-black rounded-sm overflow-hidden shadow-[0_0_20px_rgba(0,0,0,0.5)]">
             <CameraViewport />
           </div>
         </div>

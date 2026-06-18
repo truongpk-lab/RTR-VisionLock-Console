@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import pathlib
+import tempfile
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.core.session import TrackingSession
+
+# Imported videos land here, then the camera opens them by path like any other
+# source. Kept in the OS temp dir so it needs no setup and is cleaned by the OS.
+UPLOAD_DIR = pathlib.Path(tempfile.gettempdir()) / "visionlock_uploads"
 
 
 class CameraStartRequest(BaseModel):
@@ -53,6 +60,23 @@ def health() -> dict[str, str]:
 @app.get("/api/status")
 def status() -> dict[str, Any]:
     return session.snapshot(include_frame=False)
+
+
+@app.post("/api/camera/upload")
+async def upload_video(request: Request, filename: str = "video.mp4") -> dict[str, str]:
+    """Store an uploaded video and return its path for /api/camera/start.
+
+    The body is the raw file bytes (streamed to disk, so large clips never load
+    fully into memory); this avoids a python-multipart dependency. The caller
+    then runs it with start_camera(source=path), which opens it like a webcam.
+    """
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    name = os.path.basename(filename) or "video.mp4"
+    dest = UPLOAD_DIR / name
+    with dest.open("wb") as out:
+        async for chunk in request.stream():
+            out.write(chunk)
+    return {"path": str(dest), "name": name}
 
 
 @app.post("/api/camera/start")
@@ -113,6 +137,11 @@ def get_config() -> dict[str, Any]:
 @app.patch("/api/config")
 def patch_config(payload: dict[str, Any]) -> dict[str, Any]:
     return session.patch_config(payload)
+
+
+@app.post("/api/config/save")
+def save_config() -> dict[str, Any]:
+    return session.save_config()
 
 
 @app.websocket("/ws/session")

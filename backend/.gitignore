@@ -7,5 +7,7 @@ runtime/*
 !runtime/.gitkeep
 models/*
 !models/.gitkeep
+config/local.yaml
+third_party/
 assets/sample_videos/*
 !assets/sample_videos/.gitkeep

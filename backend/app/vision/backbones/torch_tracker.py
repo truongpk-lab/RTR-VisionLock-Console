@@ -118,6 +118,11 @@ class StarkLineageBackbone:
                 setattr(params, attr, str(checkpoint))
         if hasattr(params, "device"):
             params.device = device
+        # PyTracking trackers read params.debug (set by the CLI test harness, which
+        # we bypass). Default it off for headless inference if the params module
+        # did not provide it.
+        if not hasattr(params, "debug"):
+            params.debug = 0
 
         cls = getattr(importlib.import_module(tracker_module), tracker_class)
         tracker = cls(params, "video")
@@ -182,7 +187,8 @@ class UETrackBackbone(StarkLineageBackbone):
     default_param_module = "lib.test.parameter.uetrack"
     default_tracker_module = "lib.test.tracker.uetrack"
     default_tracker_class = "UETrack"
-    default_param_name = "uetrack_b"
+    # Param name = experiments/uetrack/<name>.yaml in the repo: uetrack_tiny/small/base.
+    default_param_name = "uetrack_tiny"
 
 
 class EVPTrackBackbone(StarkLineageBackbone):

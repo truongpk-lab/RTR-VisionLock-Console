@@ -22,12 +22,24 @@ def test_camera_motion_shifts_prediction():
     g = EKFGate({})
     g.reset((100, 100, 20, 20))
     base_cx, _ = _center(g.predict())
-    g.set_camera_motion(SimpleNamespace(ok=True, tx=30.0, ty=0.0))
+    g.set_camera_motion(SimpleNamespace(ok=True, tx=30.0, ty=0.0, inlier_ratio=0.9))
     shifted_cx, _ = _center(g.predict())
     assert shifted_cx - base_cx == 30  # background pan folded into the prediction
-    g.set_camera_motion(SimpleNamespace(ok=False, tx=30.0, ty=0.0))
+    g.set_camera_motion(SimpleNamespace(ok=False, tx=30.0, ty=0.0, inlier_ratio=0.0))
     nomotion_cx, _ = _center(g.predict())
     assert nomotion_cx == base_cx  # ok=False -> no compensation, falls back to CV
+
+
+def test_low_inlier_ratio_drops_camera_motion():
+    # A moving distractor dominating the flow drives the RANSAC inlier ratio down;
+    # the (tx, ty) is then unreliable and must be ignored (constant-velocity only).
+    g = EKFGate({})
+    g.reset((100, 100, 20, 20))
+    base_cx, _ = _center(g.predict())
+    g.set_camera_motion(SimpleNamespace(ok=True, tx=30.0, ty=0.0, inlier_ratio=0.2))
+    assert _center(g.predict())[0] == base_cx  # below min_inlier_ratio -> rejected
+    g.set_camera_motion(SimpleNamespace(ok=True, tx=30.0, ty=0.0, inlier_ratio=0.9))
+    assert _center(g.predict())[0] - base_cx == 30  # high ratio -> applied
 
 
 def test_filter_reduces_center_jitter():

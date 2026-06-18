@@ -55,18 +55,31 @@ class TrackingPolicy:
         # Consecutive sub-stable (but not lost) frames tolerated before handing the
         # target from the normal tracker to the re-find tracker.
         self.refind_after = max(1, int(tracking.get("refind_after", 2)))
+        # Consecutive sub-min_similarity frames (tracker still ok, but on the wrong
+        # object) inside UNCERTAIN before forcing LOST -> global re-detect. Larger
+        # than lost_frames: this is a soft "tracking-something-wrong" loss, so we
+        # are more patient than for a hard ok=False loss.
+        self.identity_lost_frames = max(1, int(thresholds.get("identity_lost_frames", 12)))
 
     def reset(self) -> None:
         """Called on every fresh lock / successful re-acquire."""
         self.mode = TrackMode.NORMAL
         self.lost_count = 0  # frames clearly below the uncertain band
         self.soft_count = 0  # consecutive frames inside the uncertain band
+        self.identity_lost_count = 0  # consecutive ok frames with low identity
 
     # Read alias for intent at call sites.
     def on_lock(self) -> None:
         self.reset()
 
-    def update(self, score: float, ok: bool) -> PolicyDecision:
+    def update(self, score: float, ok: bool, identity_lost: bool = False) -> PolicyDecision:
+        # Track how long the tracker has been ok but on a low-identity (wrong)
+        # box. Any solid/recovered frame clears the streak.
+        if ok and identity_lost:
+            self.identity_lost_count += 1
+        else:
+            self.identity_lost_count = 0
+
         # Tier A: solid frame -> normal tracking.
         if ok and score >= self.stable:
             reinit_normal = self.mode == TrackMode.REFIND
@@ -83,6 +96,15 @@ class TrackingPolicy:
             if self.mode == TrackMode.NORMAL and self.soft_count >= self.refind_after:
                 self.mode = TrackMode.REFIND
                 seed_refind = True
+            # Stuck-on-wrong-object escape: a tracker that stays ok inside the
+            # UNCERTAIN band with persistently low identity never reaches the LOST
+            # branch below (lost_count only counts ok=False frames). Force the
+            # escalation to global re-detect so the true target can be re-found.
+            if self.identity_lost_count >= self.identity_lost_frames:
+                if self.mode == TrackMode.NORMAL:
+                    self.mode = TrackMode.REFIND
+                    seed_refind = True
+                return PolicyDecision(self.mode, TrackingState.LOST, seed_refind, False, True)
             return PolicyDecision(self.mode, TrackingState.UNCERTAIN, seed_refind, False, False)
 
         # Tier C path: lost this frame. Slip straight to the re-find tracker if we
@@ -150,8 +172,8 @@ class ConfidenceManager:
     def mode(self) -> TrackMode:
         return self.policy.mode
 
-    def update(self, score: float, ok: bool) -> GateDecision:
-        decision = self.policy.update(score, ok)
+    def update(self, score: float, ok: bool, identity_lost: bool = False) -> GateDecision:
+        decision = self.policy.update(score, ok, identity_lost)
         label = _CONFIDENCE_LABEL.get(decision.state, "UNCERTAIN")
         self.confidence_state = label
         return GateDecision(

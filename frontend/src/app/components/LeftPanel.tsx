@@ -1,11 +1,34 @@
-import { Play, Square, Crosshair, Lock, RotateCcw, ScanSearch } from "lucide-react";
-import { useState } from "react";
+import { Play, Square, Crosshair, Lock, RotateCcw, ScanSearch, Upload } from "lucide-react";
+import { useRef, useState, type ChangeEvent } from "react";
 import { useTrackingSession } from "../lib/trackingSession";
 
 export function LeftPanel() {
-  const { connected, session, startCamera, stopCamera, selectTarget, pickTarget, resetTracking, forceReacquire, applyPrompt } = useTrackingSession();
+  const { connected, session, startCamera, stopCamera, uploadVideo, selectTarget, pickTarget, resetTracking, forceReacquire, applyPrompt } = useTrackingSession();
   const [prompt, setPrompt] = useState("Silver SUV, plate ending in 8X");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [video, setVideo] = useState<{ path: string; name: string } | null>(null);
+  const [importing, setImporting] = useState(false);
   const trackingState = session.state;
+
+  const onPickVideo = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = ""; // let the operator re-pick the same file later
+    if (!file) return;
+    setImporting(true);
+    try {
+      setVideo(await uploadVideo(file));
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const runVideo = async () => {
+    if (!video) return;
+    if (session.metrics.camera === "ACTIVE") await stopCamera();
+    await startCamera(video.path);
+  };
 
   return (
     <div className="w-64 flex-shrink-0 border-r border-slate-800/60 bg-[#0a0f16] flex flex-col z-10 overflow-y-auto">
@@ -17,7 +40,23 @@ export function LeftPanel() {
         <div className="flex flex-col gap-2">
           <ActionButton icon={Play} label="START CAMERA" onClick={() => startCamera()} active={session.metrics.camera === "ACTIVE"} disabled={!connected} />
           <ActionButton icon={Square} label="STOP CAMERA" onClick={stopCamera} variant="danger" disabled={!connected} />
-          
+
+          <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={onPickVideo} />
+          <ActionButton
+            icon={Upload}
+            label={importing ? "IMPORTING…" : "IMPORT VIDEO"}
+            onClick={() => fileInputRef.current?.click()}
+            disabled={!connected || importing}
+          />
+          {video && (
+            <>
+              <div className="px-3 text-[10px] font-mono text-slate-500 truncate" title={video.name}>
+                {video.name}
+              </div>
+              <ActionButton icon={Play} label="RUN VIDEO" onClick={runVideo} variant="cyan" disabled={!connected} />
+            </>
+          )}
+
           <div className="h-px bg-slate-800 my-2"></div>
           
           <ActionButton

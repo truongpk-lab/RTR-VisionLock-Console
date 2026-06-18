@@ -69,6 +69,25 @@ class ManagedTracker:
     def _is_fallback(self) -> bool:
         return self.source == "opencv"
 
+    @property
+    def is_opencv(self) -> bool:
+        """The OpenCV backbone is running (no real confidence score; flat affinity).
+
+        Used to decide that tracker confidence must be estimated from honest
+        signals (identity + stability) rather than the backbone's own score.
+        """
+        return self._is_fallback()
+
+    @property
+    def is_fallback(self) -> bool:
+        """A non-opencv backbone was requested but OpenCV is running -> silent fallback.
+
+        Drives the operator-facing warning/badge. An explicit opencv request (or
+        auto-resolve) is not a surprise, so it is not flagged.
+        """
+        requested = (self.requested or "").lower()
+        return self.is_opencv and requested not in ("", "opencv")
+
     def init(self, frame: np.ndarray, bbox: BBox) -> bool:
         ok = self.backbone.init(frame, bbox)
         if not ok and not self._is_fallback():
@@ -93,7 +112,12 @@ class ManagedTracker:
         return result
 
     def to_dict(self) -> dict:
-        info = {"source": self.source, "kind": self.kind, "requested": self.requested or "auto"}
+        info = {
+            "source": self.source,
+            "kind": self.kind,
+            "requested": self.requested or "auto",
+            "fallback": self.is_fallback,
+        }
         last_error = getattr(self.backbone, "last_error", "")
         if last_error:
             info["last_error"] = last_error

@@ -45,11 +45,11 @@ models:
   tracker_uetrack:
     enabled: true
     repo_path: ""                  # absolute path to the cloned UETrack repo
-    checkpoint: models/uetrack_t.pth
+    checkpoint: models/uetrack_tiny.pth
     param_module: lib.test.parameter.uetrack
     tracker_module: lib.test.tracker.uetrack
     tracker_class: UETrack
-    param_name: uetrack_t          # S/T variant for >=60 FPS (was uetrack_b)
+    param_name: uetrack_tiny       # experiments/uetrack/<name>.yaml: tiny/small/base
   # Tier B re-find tracker: EVPTrack-224 (AAAI 2024) spatio-temporal visual prompts.
   tracker_evptrack:
     enabled: true
@@ -80,13 +80,30 @@ thresholds:
   stable_threshold: 0.70
   uncertain_threshold: 0.45
   lost_frames: 5
-  reacquire_threshold: 0.75
+  reacquire_threshold: 0.62
   memory_update_threshold: 0.78
   kalman_max_error: 80
   min_similarity: 0.55
+  # Consecutive ok frames with identity < min_similarity (tracker stuck on the
+  # wrong object) tolerated inside UNCERTAIN before forcing LOST -> global
+  # re-detect. ~0.4s @30fps; larger than lost_frames because this is a soft loss.
+  identity_lost_frames: 12
   mask_iou_threshold: 0.50
   # Motion-consistency above this is treated as "calm" for adaptive SAM2 refine.
   stable_motion: 0.70
+  # Honest confidence for the OpenCV fallback tracker. OpenCV has no real score
+  # (flat affinity=1.0) and the jitter signal is fooled by SMOOTH drift, so when
+  # the active backbone is the fallback we estimate confidence from the signals
+  # that actually catch drift (appearance identity + bbox stability) and cap it so
+  # a fallback can never hold STABLE on ok=True alone.
+  negative_penalty_weight: 0.25   # subtracted from track_score per negative similarity
+  fallback_confidence_cap: 0.75   # hard ceiling on fallback tracker confidence
+  fallback_identity_weight: 0.6   # weight of identity in the fallback estimate
+  fallback_stability_weight: 0.4  # weight of jitter-stability in the fallback estimate
+  # Ceiling on confidence for a tracker that reports a flat affinity=1.0 (SAM2
+  # mask, or a deep tracker whose fork omits a score key): jitter-stability alone
+  # saturates near 1.0 on any locally smooth box, so it must not buy a full STABLE.
+  flat_confidence_cap: 0.85
 
 runtime:
   device: cuda
@@ -126,6 +143,10 @@ tracking:
   # Consecutive sub-stable (but not lost) frames before handing A -> B. Higher =
   # more patient on the strong tracker before switching to the re-find tracker.
   refind_after: 2
+  # Entering REFIND seeds the re-find tracker on a box enlarged by this factor, to
+  # widen the local search before the loss escalates to a full global re-detect.
+  # 1.0 disables the widening (seed on the exact last box).
+  wide_search_scale: 1.5
 
 motion:
   # Camera ego-motion compensation: sparse LK optical flow on background features
@@ -141,6 +162,7 @@ motion:
     feature_min_distance: 8
     target_mask_margin: 0.2       # dilate target bbox before excluding it from flow
     min_inliers: 12               # below this -> ok=false (gate falls back)
+    min_inlier_ratio: 0.5         # below this -> drop ego-motion input (moving distractor dominates flow)
     lk_win: 21
   ekf:
     q_pos: 1.0                    # process noise: center position
@@ -180,12 +202,29 @@ identity:
   encoder: hsv_block_texture
   min_margin: 0.12
   negative_slots: 8
+  # Optional deep ReID embedding to separate genuine look-alikes. Set
+  # encoder: fused to enable (needs the ONNX model below + onnxruntime, which is
+  # in the base install). Missing model -> automatic fallback to the handcrafted
+  # encoder, so the default stays CPU-light and dependency-free. Export OSNet
+  # (e.g. osnet_x0_25) to ONNX once with boxmot/torchreid; same file runs CPU on
+  # dev and TensorRT/CUDA on Jetson by switching providers.
+  deep:
+    model_path: models/osnet_x0_25.onnx
+    input_size: [256, 128]            # H, W (OSNet)
+    providers: [CPUExecutionProvider] # Jetson: [TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider]
+    fast_weight: 0.45
+    deep_weight: 0.45
 
 reacquire:
   identity_weight: 0.45
   motion_weight: 0.25
   detector_weight: 0.15
   mask_weight: 0.15
+  # "Find that label again": narrow global re-detection to the locked target's
+  # class before ranking by appearance/motion, so look-alikes of other classes are
+  # never considered. Needs a labelled detector (COCO yolo11n / yolo11n-seg). When
+  # the class is unknown or no same-class candidate is present, falls back to all.
+  match_label: true
   # Global re-detection (Tier C) runs only when LOST, at low frequency, and must
   # confirm a candidate over several consecutive, spatially-consistent frames
   # (matched to the long-term anchor) before re-locking — no single-frame flapping.
@@ -193,14 +232,59 @@ reacquire:
   confirm_frames: 3             # consecutive confirmations required before re-lock
   confirm_iou_gate: 0.3         # spatial consistency between confirmation frames
   confirm_max_gap: 1            # tolerated misses without losing the streak
+  # A confirmation also counts if EITHER the centres are within
+  # confirm_center_gate_scale*box (fast motion, IoU~0) OR appearance reid_score
+  # >= confirm_identity_gate (same target, moved far). 0 / 1.01 disable each.
+  confirm_center_gate_scale: 1.5
+  confirm_identity_gate: 0.82
+  # Instant re-lock fast-path: a candidate that already passed the anchor+strength
+  # gate AND has reid_score >= fast_relock_identity, within fast_relock_max_age
+  # seconds of loss (motion still corroborates position), re-locks on a single
+  # detection instead of accumulating the confirmation streak. Default 1.01 = OFF
+  # (no single value can reach it) so the portable default keeps the multi-frame
+  # confirmation; enable per-box in local.yaml (e.g. 0.9).
+  fast_relock_identity: 1.01
+  fast_relock_max_age: 2.0
+  # Parallel confirmation hypotheses kept while re-detecting, so a consistent
+  # runner-up is not wiped each frame by the detector's top pick. 1 = single
+  # hypothesis (original behaviour); 2-3 is a good range when distractors appear.
+  top_k: 2
   learn_distractors: true       # add rejected look-alikes to the negative bank
   distractor_min_score: 0.5     # min detector score to bother learning a distractor
+  # Dynamic re-acquire scoring: as the loss ages, trust motion less and identity
+  # more. lost_short/lost_long (seconds) pick which weight tier applies. A far-away
+  # re-appearance after a long loss is then re-locked on appearance, not penalised
+  # for being far from the stale Kalman prediction.
+  lost_short_sec: 1.0
+  lost_long_sec: 3.0
+  detect_hz_long: 1             # slower full-frame cadence once lost beyond lost_long_sec
+  weights_early:                # < lost_short_sec: still trust motion
+    identity_weight: 0.40
+    motion_weight: 0.30
+    detector_weight: 0.15
+    mask_weight: 0.15
+  weights_mid:                  # lost_short..lost_long: balanced (matches static)
+    identity_weight: 0.45
+    motion_weight: 0.25
+    detector_weight: 0.15
+    mask_weight: 0.15
+  weights_late:                 # > lost_long_sec: motion ~0, identity dominates
+    identity_weight: 0.65
+    motion_weight: 0.0
+    detector_weight: 0.20
+    mask_weight: 0.15
 
 learning:
   duration_sec: 2.5
   min_samples: 8
   max_samples: 20
   quality_threshold: 80.0
+  # Mask-aware appearance: every Nth harvested sample is refined with SAM2 to get
+  # this frame's foreground mask, so shadow/road inside the box is excluded from
+  # the colour/deep template. Per-frame refine is too heavy (SAM2 set_image), so
+  # only ~max_samples/N refines run during the brief learning window. Needs the
+  # SAM2 backend; otherwise samples are box-only (mask=None) as before.
+  mask_refine_every: 4
 
 memory:
   base_id_prefix: TGT

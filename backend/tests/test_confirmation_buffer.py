@@ -47,3 +47,28 @@ def test_reset_clears_state():
     buf.reset()
     assert buf.streak == 0
     assert buf.best_bbox() is None
+
+
+def test_center_gate_keeps_streak_when_iou_zero():
+    # Fast target: consecutive boxes barely overlap (IoU~0) but centres are close.
+    buf = ConfirmationBuffer(need=2, max_gap=0, iou_gate=0.3, center_gate=1.5)
+    buf.push((10, 10, 20, 20), 0.8)
+    buf.push((34, 10, 20, 20), 0.8)  # shifted ~24px > box, IoU 0; within 1.5*box
+    assert buf.confirmed()
+
+
+def test_identity_gate_keeps_streak_when_iou_zero():
+    # Same target reappeared far away but appearance is a strong match.
+    buf = ConfirmationBuffer(need=2, max_gap=0, iou_gate=0.3, identity_gate=0.82)
+    buf.push((10, 10, 20, 20), 0.9)
+    buf.push((300, 300, 20, 20), 0.9)  # far -> IoU 0, but reid 0.9 >= 0.82
+    assert buf.confirmed()
+
+
+def test_or_gates_off_by_default_preserve_iou_only():
+    # With the new gates at their defaults, a far low-IoU jump still restarts.
+    buf = ConfirmationBuffer(need=2, max_gap=0, iou_gate=0.3)
+    buf.push((10, 10, 20, 20), 0.9)
+    buf.push((300, 300, 20, 20), 0.9)
+    assert buf.streak == 1
+    assert not buf.confirmed()

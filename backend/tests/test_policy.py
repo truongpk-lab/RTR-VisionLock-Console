@@ -66,6 +66,40 @@ def test_one_good_frame_resets_loss_counter():
     assert all(not d.reacquire for d in follow)  # needs 3 fresh consecutive losses
 
 
+def _policy_with_identity_gate(identity_lost_frames: int) -> TrackingPolicy:
+    return TrackingPolicy(
+        {
+            "thresholds": {
+                "stable_threshold": 0.70,
+                "uncertain_threshold": 0.45,
+                "lost_frames": 3,
+                "identity_lost_frames": identity_lost_frames,
+            },
+            "tracking": {"refind_after": 2},
+        }
+    )
+
+
+def test_sustained_low_identity_escalates_to_lost():
+    # Tracker stays ok inside the uncertain band but on the wrong object (low
+    # identity): lost_count never increments, so without this gate it would sit in
+    # UNCERTAIN forever. After identity_lost_frames it must force LOST + reacquire.
+    policy = _policy_with_identity_gate(identity_lost_frames=3)
+    decisions = [policy.update(0.6, ok=True, identity_lost=True) for _ in range(3)]
+    assert not decisions[0].reacquire  # still patient
+    assert decisions[-1].state == TrackingState.LOST
+    assert decisions[-1].reacquire is True
+
+
+def test_identity_lost_streak_resets_on_recovered_identity():
+    policy = _policy_with_identity_gate(identity_lost_frames=3)
+    policy.update(0.6, ok=True, identity_lost=True)
+    policy.update(0.6, ok=True, identity_lost=True)
+    policy.update(0.6, ok=True, identity_lost=False)  # identity recovered -> reset
+    follow = [policy.update(0.6, ok=True, identity_lost=True) for _ in range(2)]
+    assert all(not d.reacquire for d in follow)  # needs a fresh full streak
+
+
 def test_reset_returns_to_normal_mode():
     policy = _policy(refind_after=1)
     policy.update(0.6, ok=True)

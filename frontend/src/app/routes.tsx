@@ -1,6 +1,10 @@
 import { createHashRouter } from "react-router";
 import { Layout } from "./components/Layout";
 import { LiveDashboard } from "./pages/LiveDashboard";
+import { ThresholdConfig } from "./pages/ThresholdConfig";
+import { ReacquireConfig } from "./pages/ReacquireConfig";
+import { MemoryConfig } from "./pages/MemoryConfig";
+import { ModelSettings } from "./pages/ModelSettings";
 
 function DummyPage({ title }: { title: string }) {
   return (
@@ -17,11 +21,11 @@ export const router = createHashRouter([
     children: [
       { index: true, Component: LiveDashboard },
       { path: "target", element: <DummyPage title="Target Setup" /> },
-      { path: "threshold", element: <DummyPage title="Threshold Config" /> },
-      { path: "reacquire", element: <DummyPage title="Re-acquire Config" /> },
-      { path: "memory", element: <DummyPage title="Memory Config" /> },
+      { path: "threshold", Component: ThresholdConfig },
+      { path: "reacquire", Component: ReacquireConfig },
+      { path: "memory", Component: MemoryConfig },
       { path: "logs", element: <DummyPage title="Logs & Diagnostics" /> },
-      { path: "settings", element: <DummyPage title="Model Settings" /> },
+      { path: "settings", Component: ModelSettings },
     ],
   },
 ]);

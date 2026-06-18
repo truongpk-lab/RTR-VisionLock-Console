@@ -36,6 +36,7 @@ export interface CandidateBox {
   motion_score?: number;
   reid_score?: number;
   is_distractor?: boolean;
+  mask_polygon?: [number, number][] | null;
 }
 
 export interface SessionMetrics {
@@ -60,6 +61,30 @@ export interface SessionLog {
   state: string;
 }
 
+export interface SessionTracking {
+  mode: string;
+  confidence_state: "LOCKED" | "UNCERTAIN" | "LOST";
+  normal_backbone: string;
+  refind_backbone: string;
+  tracker_fallback: boolean;
+  refind_fallback: boolean;
+  reacquire: { confirming: number; need: number; detect_hz: number };
+}
+
+export interface SessionDebug {
+  tracker_backend: string;
+  tracker_fallback: boolean;
+  refind_backend: string;
+  refind_fallback: boolean;
+  proposal_source: string;
+  lost_age_sec: number;
+  negative_similarity: number;
+  positive_negative_margin: number;
+  reacquire_score: number;
+  ego_motion_ok: boolean;
+  ego_motion_inlier_ratio: number;
+}
+
 export interface SessionSnapshot {
   app: string;
   state: TrackingState;
@@ -67,6 +92,7 @@ export interface SessionSnapshot {
   frame_size: [number, number];
   target_bbox: [number, number, number, number] | null;
   kalman_bbox: [number, number, number, number] | null;
+  target_mask?: [number, number][] | null;
   candidate_boxes: CandidateBox[];
   selected_candidate_id: string | null;
   learning: {
@@ -92,6 +118,8 @@ export interface SessionSnapshot {
     video_memory_window?: number;
     last_error?: string;
   };
+  tracking?: SessionTracking;
+  debug?: SessionDebug;
   metrics: SessionMetrics;
   memory: {
     base_id: string;
@@ -118,6 +146,7 @@ interface TrackingContextValue {
   session: SessionSnapshot;
   startCamera: (source?: string) => Promise<void>;
   stopCamera: () => Promise<void>;
+  uploadVideo: (file: File) => Promise<{ path: string; name: string }>;
   selectTarget: () => Promise<void>;
   segmentTarget: (point: { x: number; y: number }) => Promise<void>;
   selectBox: (bbox: [number, number, number, number]) => Promise<void>;
@@ -126,6 +155,9 @@ interface TrackingContextValue {
   resetTracking: () => Promise<void>;
   forceReacquire: () => Promise<void>;
   applyPrompt: (prompt: string) => Promise<void>;
+  getConfig: () => Promise<Record<string, any>>;
+  patchConfig: (patch: Record<string, any>) => Promise<Record<string, any>>;
+  saveConfig: () => Promise<{ saved: string }>;
 }
 
 const emptyMetrics: SessionMetrics = {
@@ -189,6 +221,22 @@ async function apiPost(path: string, body?: unknown) {
   return response.json();
 }
 
+async function apiGet(path: string) {
+  const response = await fetch(apiUrl(path));
+  if (!response.ok) throw new Error(`${path} failed with ${response.status}`);
+  return response.json();
+}
+
+async function apiPatch(path: string, body: unknown) {
+  const response = await fetch(apiUrl(path), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${path} failed with ${response.status}`);
+  return response.json();
+}
+
 export function TrackingSessionProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [session, setSession] = useState<SessionSnapshot>(fallbackSession);
@@ -234,6 +282,19 @@ export function TrackingSessionProvider({ children }: { children: ReactNode }) {
       session,
       startCamera: async (source?: string) => refreshFromAction(await apiPost("/api/camera/start", { source: source || undefined })),
       stopCamera: async () => refreshFromAction(await apiPost("/api/camera/stop")),
+      uploadVideo: async (file: File) => {
+        // Raw-body upload (no multipart): the backend streams these bytes to a
+        // temp file and returns its path, which RUN VIDEO feeds to startCamera.
+        const response = await fetch(apiUrl(`/api/camera/upload?filename=${encodeURIComponent(file.name)}`), {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        if (!response.ok) {
+          throw new Error(`/api/camera/upload failed with ${response.status}`);
+        }
+        return response.json() as Promise<{ path: string; name: string }>;
+      },
       selectTarget: async () => refreshFromAction(await apiPost("/api/target/select")),
       segmentTarget: async (point: { x: number; y: number }) =>
         refreshFromAction(await apiPost("/api/target/segment", { point })),
@@ -246,6 +307,9 @@ export function TrackingSessionProvider({ children }: { children: ReactNode }) {
       resetTracking: async () => refreshFromAction(await apiPost("/api/tracking/reset")),
       forceReacquire: async () => refreshFromAction(await apiPost("/api/reacquire/force")),
       applyPrompt: async (prompt: string) => refreshFromAction(await apiPost("/api/prompt/apply", { prompt })),
+      getConfig: async () => apiGet("/api/config"),
+      patchConfig: async (patch: Record<string, any>) => apiPatch("/api/config", patch),
+      saveConfig: async () => apiPost("/api/config/save"),
     }),
     [connected, refreshFromAction, session],
   );

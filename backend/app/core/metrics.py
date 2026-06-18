@@ -12,12 +12,14 @@ def track_score(
     appearance_similarity: float,
     motion_consistency: float,
     mask_quality: float = 1.0,
+    negative_penalty: float = 0.0,
 ) -> float:
     return clamp(
         0.35 * tracker_confidence
         + 0.25 * appearance_similarity
         + 0.20 * motion_consistency
         + 0.20 * mask_quality
+        - negative_penalty
     )
 
 

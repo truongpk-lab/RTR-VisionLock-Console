@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { MouseEvent } from "react";
-import { Crosshair, Maximize2, Minimize2 } from "lucide-react";
+import type { MouseEvent, CSSProperties } from "react";
+import { Maximize2, Minimize2 } from "lucide-react";
 import { useTrackingSession } from "../lib/trackingSession";
 
 export function CameraViewport() {
@@ -138,7 +138,7 @@ export function CameraViewport() {
       <img
         src={frameSrc}
         alt="Camera Feed"
-        className={`w-full h-full opacity-80 ${isFullscreen ? "object-contain" : "object-cover"}`}
+        className="w-full h-full opacity-80 object-cover"
       />
       
       {/* Dark overlay for better UI contrast */}
@@ -146,11 +146,6 @@ export function CameraViewport() {
 
       {/* Tactical Grid */}
       <div className="absolute inset-0 bg-[linear-gradient(rgba(14,165,233,0.05)_1px,transparent_1px),linear-gradient(90deg,rgba(14,165,233,0.05)_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none">
-      </div>
-      
-      {/* Center Crosshair */}
-      <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-cyan-500/30 pointer-events-none">
-        <Crosshair size={120} strokeWidth={0.5} />
       </div>
 
       {/* Overlays based on state */}
@@ -204,6 +199,12 @@ export function CameraViewport() {
 
       {/* Status Overlay UI */}
       <div className="absolute top-4 right-4 flex items-center gap-2">
+         {(session.debug?.tracker_fallback ?? session.tracking?.tracker_fallback) && (
+           <div className="px-2 py-1 bg-rose-500/20 border border-rose-500/50 text-rose-300 font-mono text-[10px] uppercase tracking-widest flex items-center gap-1.5 rounded-sm backdrop-blur-sm" title="Requested deep tracker unavailable; running OpenCV fallback">
+             <span className="w-2 h-2 bg-rose-400 rounded-full"></span>
+             OPENCV FALLBACK
+           </div>
+         )}
          {trackingState === "SEARCHING" ? (
            <div className="px-3 py-1 bg-amber-500/20 border border-amber-500/50 text-amber-400 font-mono text-xs uppercase tracking-widest animate-pulse flex items-center gap-2 rounded-sm backdrop-blur-sm">
              <span className="w-2 h-2 bg-amber-400 rounded-full"></span>
@@ -243,9 +244,58 @@ export function CameraViewport() {
   );
 }
 
+// Locked-target reticle: bright-red corner brackets [ ] + centre crosshair.
+// Corner arms are a % of the box and the stroke steps up with the on-screen
+// area, so the reticle is small for far targets and large for near ones.
+function TargetReticle({
+  style,
+  label,
+  sizeRatio,
+}: {
+  style: CSSProperties;
+  label: string;
+  sizeRatio: number;
+}) {
+  const RED = "#ff2d2d";
+  const stroke = sizeRatio > 0.04 ? 3 : sizeRatio > 0.012 ? 2.5 : 1.5;
+  const ARM = "22%"; // length of each corner bracket arm
+  const corners: CSSProperties[] = [
+    { top: 0, left: 0, borderTop: `${stroke}px solid ${RED}`, borderLeft: `${stroke}px solid ${RED}` },
+    { top: 0, right: 0, borderTop: `${stroke}px solid ${RED}`, borderRight: `${stroke}px solid ${RED}` },
+    { bottom: 0, left: 0, borderBottom: `${stroke}px solid ${RED}`, borderLeft: `${stroke}px solid ${RED}` },
+    { bottom: 0, right: 0, borderBottom: `${stroke}px solid ${RED}`, borderRight: `${stroke}px solid ${RED}` },
+  ];
+  return (
+    <div className="absolute" style={{ ...style, filter: "drop-shadow(0 0 3px rgba(255,45,45,0.85))" }}>
+      {corners.map((c, i) => (
+        <div key={i} className="absolute" style={{ width: ARM, height: ARM, ...c }} />
+      ))}
+      <div
+        className="absolute"
+        style={{ left: "50%", top: "50%", width: "14%", height: `${stroke}px`, background: RED, transform: "translate(-50%,-50%)" }}
+      />
+      <div
+        className="absolute"
+        style={{ left: "50%", top: "50%", width: `${stroke}px`, height: "14%", background: RED, transform: "translate(-50%,-50%)" }}
+      />
+      <div
+        className="absolute -top-5 left-0 text-black text-[9px] font-mono font-bold px-1 uppercase tracking-wider"
+        style={{ background: RED }}
+      >
+        {label}
+      </div>
+    </div>
+  );
+}
+
 function LiveOverlays({ session }: { session: ReturnType<typeof useTrackingSession>["session"] }) {
   const [frameWidth, frameHeight] = session.frame_size;
   if (!frameWidth || !frameHeight) return null;
+  // Hide the target overlay while the system has lost the target and is
+  // re-detecting; the dashed candidate boxes still render so the operator sees
+  // what is being evaluated. The reticle reappears on a confirmed re-lock.
+  const lost = session.state === "SEARCHING" || session.state === "LOST";
+  const learning = session.state === "LEARNING_TARGET";
 
   const toStyle = (bbox: [number, number, number, number]) => ({
     left: `${(bbox[0] / frameWidth) * 100}%`,
@@ -254,8 +304,44 @@ function LiveOverlays({ session }: { session: ReturnType<typeof useTrackingSessi
     height: `${(bbox[3] / frameHeight) * 100}%`,
   });
 
+  const maskColor = (candidate: { is_distractor?: boolean; refined?: boolean; id: string }) =>
+    candidate.is_distractor
+      ? "rgba(251,113,133,0.35)" // rose
+      : candidate.refined || session.selected_candidate_id === candidate.id
+        ? "rgba(251,191,36,0.40)" // amber
+        : "rgba(34,211,238,0.28)"; // cyan
+  const toPoints = (poly: [number, number][]) => poly.map(([x, y]) => `${x},${y}`).join(" ");
+
   return (
     <div className="absolute inset-0 pointer-events-none">
+      {/* Coloured object masks (YOLO-seg per candidate + SAM2 target while learning).
+          viewBox is the full frame so polygon pixels map exactly like the % boxes. */}
+      <svg
+        className="absolute inset-0 w-full h-full"
+        viewBox={`0 0 ${frameWidth} ${frameHeight}`}
+        preserveAspectRatio="none"
+      >
+        {session.candidate_boxes.map((candidate) =>
+          candidate.mask_polygon && candidate.mask_polygon.length >= 3 ? (
+            <polygon
+              key={`mask-${candidate.id}`}
+              points={toPoints(candidate.mask_polygon)}
+              fill={maskColor(candidate)}
+              stroke={maskColor(candidate)}
+              strokeWidth={1}
+            />
+          ) : null,
+        )}
+        {session.target_mask && session.target_mask.length >= 3 && (
+          <polygon
+            points={toPoints(session.target_mask)}
+            fill="rgba(52,211,153,0.40)"
+            stroke="rgba(52,211,153,0.9)"
+            strokeWidth={1.5}
+          />
+        )}
+      </svg>
+
       {session.candidate_boxes.map((candidate) => (
         <div
           key={candidate.id}
@@ -275,28 +361,28 @@ function LiveOverlays({ session }: { session: ReturnType<typeof useTrackingSessi
         </div>
       ))}
 
-      {session.target_bbox && (
+      {/* LEARNING keeps its emerald solid box (distinct phase). */}
+      {session.target_bbox && learning && (
         <div
-          className={`absolute border-2 ${
-            session.state === "LEARNING_TARGET"
-              ? "border-emerald-400 bg-emerald-400/10 shadow-[0_0_10px_rgba(52,211,153,0.5)]"
-              : "border-cyan-400 bg-cyan-400/10 shadow-[0_0_10px_rgba(34,211,238,0.5)]"
-          }`}
+          className="absolute border-2 border-emerald-400 bg-emerald-400/10 shadow-[0_0_10px_rgba(52,211,153,0.5)]"
           style={toStyle(session.target_bbox)}
         >
-          {session.state === "LEARNING_TARGET" ? (
-            <div className="absolute -top-5 left-0 bg-emerald-400 text-black text-[9px] font-mono font-bold px-1 uppercase tracking-wider">
-              LEARNING {session.learning.samples} · {session.learning.elapsed.toFixed(1)}/{session.learning.duration.toFixed(1)}s
-            </div>
-          ) : (
-            <div className="absolute -top-5 left-0 bg-cyan-400 text-black text-[9px] font-mono font-bold px-1 uppercase tracking-wider">
-              {session.memory.base_id} {session.metrics.track_score.toFixed(2)}
-            </div>
-          )}
+          <div className="absolute -top-5 left-0 bg-emerald-400 text-black text-[9px] font-mono font-bold px-1 uppercase tracking-wider">
+            LEARNING {session.learning.samples} · {session.learning.elapsed.toFixed(1)}/{session.learning.duration.toFixed(1)}s
+          </div>
         </div>
       )}
 
-      {session.kalman_bbox && (
+      {/* Locked/tracking: red corner-bracket reticle, hidden while lost. */}
+      {session.target_bbox && !learning && !lost && (
+        <TargetReticle
+          style={toStyle(session.target_bbox)}
+          label={`${session.memory.base_id} ${session.metrics.track_score.toFixed(2)}`}
+          sizeRatio={(session.target_bbox[2] * session.target_bbox[3]) / (frameWidth * frameHeight)}
+        />
+      )}
+
+      {session.kalman_bbox && !learning && !lost && (
         <div
           className="absolute border border-dashed border-amber-400/70 bg-amber-400/5"
           style={toStyle(session.kalman_bbox)}

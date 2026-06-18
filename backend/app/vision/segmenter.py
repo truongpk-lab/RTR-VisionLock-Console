@@ -50,6 +50,10 @@ class SegmentResult:
     quality: float
     backend: str
     refined: bool = True
+    polygon: list[list[int]] | None = None
+    # Selected boolean foreground mask (full-frame, ``bool``). Only SAM2 sets it;
+    # used to exclude shadow/background when building the appearance template.
+    mask: np.ndarray | None = None
 
 
 class PromptableSegmenter:
@@ -192,12 +196,15 @@ class PromptableSegmenter:
             # SAMURAI mask selection: prefer the mask agreeing with the motion
             # prediction (Kalman), falling back to the prompt box before motion exists.
             candidates: list[MaskCandidate] = []
+            mask_by_bbox: dict[tuple, np.ndarray] = {}
             for idx, mask in enumerate(masks):
-                candidate_bbox = self._mask_to_bbox(mask.astype(bool))
+                mask_bool = mask.astype(bool)
+                candidate_bbox = self._mask_to_bbox(mask_bool)
                 if candidate_bbox is None:
                     continue
                 affinity = float(scores[idx]) if scores is not None and len(scores) > idx else bbox_iou(bbox, candidate_bbox)
                 candidates.append(MaskCandidate(bbox=candidate_bbox, affinity=affinity))
+                mask_by_bbox.setdefault(tuple(candidate_bbox), mask_bool)
             selection = select_motion_aware_mask(
                 candidates,
                 predicted_bbox=motion_bbox or bbox,
@@ -210,7 +217,15 @@ class PromptableSegmenter:
             if self._overlaps_distractor(refined, negative_boxes):
                 return SegmentResult(bbox=clamp_bbox(bbox, width, height), quality=0.0, backend="sam2", refined=False)
             quality = selection.affinity if scores is not None and len(scores) else bbox_iou(bbox, refined)
-            return SegmentResult(bbox=clamp_bbox(refined, width, height), quality=max(0.0, min(1.0, quality)), backend="sam2")
+            mask_bool = mask_by_bbox.get(tuple(refined))
+            polygon = self._mask_to_polygon(mask_bool)
+            return SegmentResult(
+                bbox=clamp_bbox(refined, width, height),
+                quality=max(0.0, min(1.0, quality)),
+                backend="sam2",
+                polygon=polygon,
+                mask=mask_bool,
+            )
         except Exception as exc:  # pragma: no cover - depends on deployment runtime
             self.last_error = str(exc)
             return None
@@ -335,6 +350,24 @@ class PromptableSegmenter:
         inv = 1.0 / scale
         rx, ry, rw, rh = refined
         return clamp_bbox((int(rx * inv), int(ry * inv), int(rw * inv), int(rh * inv)), width, height)
+
+    @staticmethod
+    def _mask_to_polygon(mask: np.ndarray | None, max_points: int = 60) -> list[list[int]] | None:
+        """Largest-contour outline of a boolean mask, simplified for the UI overlay."""
+        if mask is None or cv2 is None:
+            return None
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        if len(contour) < 3:
+            return None
+        epsilon = 0.01 * cv2.arcLength(contour, True)
+        pts = cv2.approxPolyDP(contour, epsilon, True).reshape(-1, 2)
+        if len(pts) > max_points:
+            step = int(np.ceil(len(pts) / max_points))
+            pts = pts[::step]
+        return [[int(x), int(y)] for x, y in pts]
 
     @staticmethod
     def _mask_to_bbox(mask: np.ndarray) -> BBox | None:

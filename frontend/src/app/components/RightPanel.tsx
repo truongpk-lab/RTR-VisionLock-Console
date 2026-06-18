@@ -1,10 +1,20 @@
-import { Target, Fingerprint, ActivitySquare, BrainCircuit } from "lucide-react";
+import { Target, Fingerprint, ActivitySquare, BrainCircuit, Cpu, AlertTriangle } from "lucide-react";
 import { useTrackingSession } from "../lib/trackingSession";
 
 export function RightPanelMetrics() {
   const { session } = useTrackingSession();
   const metrics = session.metrics;
   const memory = session.memory;
+  const tracking = session.tracking;
+  const debug = session.debug;
+  const fallback = Boolean(debug?.tracker_fallback ?? tracking?.tracker_fallback);
+  const confidenceState = tracking?.confidence_state ?? session.state;
+  const stateColor =
+    confidenceState === "LOCKED"
+      ? "text-emerald-400"
+      : confidenceState === "UNCERTAIN"
+        ? "text-amber-400"
+        : "text-rose-400";
   return (
     <div className="w-64 flex-shrink-0 border-l border-slate-800/60 bg-[#0a0f16] flex flex-col z-10 overflow-y-auto">
       <div className="p-4 border-b border-slate-800/60 bg-slate-900/20">
@@ -12,11 +22,44 @@ export function RightPanelMetrics() {
           <ActivitySquare size={14} className="text-cyan-500" />
           Primary Metrics
         </h2>
-        
+
         <div className="space-y-4">
           <ProgressMetric label="Track Score" value={metrics.track_score * 100} color="bg-cyan-500" />
           <ProgressMetric label="Confidence" value={metrics.confidence * 100} color="bg-emerald-500" />
           <ProgressMetric label="Similarity" value={metrics.similarity * 100} color="bg-blue-500" />
+        </div>
+      </div>
+
+      <div className="p-4 border-b border-slate-800/60">
+        <h2 className="text-xs font-mono font-bold text-slate-300 uppercase tracking-widest mb-4 flex items-center gap-2">
+          <Cpu size={14} className="text-cyan-500" />
+          Tracking Engine
+        </h2>
+
+        {fallback && (
+          <div className="mb-3 p-2 rounded border border-rose-800/60 bg-rose-950/30 flex items-start gap-2">
+            <AlertTriangle size={13} className="text-rose-400 mt-0.5 flex-shrink-0" />
+            <span className="text-[10px] font-mono text-rose-300 leading-tight">
+              OpenCV fallback — deep tracker unavailable. Accuracy / re-acquire limited.
+            </span>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <DebugRow label="State" value={confidenceState} valueClass={stateColor} />
+          <DebugRow label="Backend" value={debug?.tracker_backend ?? tracking?.normal_backbone ?? "—"} valueClass={fallback ? "text-rose-400" : "text-cyan-400"} />
+          <DebugRow label="Proposal Src" value={debug?.proposal_source ?? "—"} />
+          <DebugRow label="Negative Sim" value={(debug?.negative_similarity ?? 0).toFixed(2)} />
+          <DebugRow label="Pos−Neg Margin" value={(debug?.positive_negative_margin ?? 0).toFixed(2)} />
+          <DebugRow label="Reacquire" value={(debug?.reacquire_score ?? 0).toFixed(2)} />
+          <DebugRow label="Lost Age" value={`${(debug?.lost_age_sec ?? 0).toFixed(1)}s`} />
+          <DebugRow
+            label="Ego-motion"
+            value={debug?.ego_motion_ok ? `ok ${(debug?.ego_motion_inlier_ratio ?? 0).toFixed(2)}` : "off"}
+          />
+          {tracking?.reacquire && (
+            <DebugRow label="Confirming" value={`${tracking.reacquire.confirming}/${tracking.reacquire.need}`} />
+          )}
         </div>
       </div>
 
@@ -74,6 +117,15 @@ export function RightPanelMetrics() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function DebugRow({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
+  return (
+    <div className="flex justify-between items-center text-[10px] font-mono">
+      <span className="text-slate-500">{label}:</span>
+      <span className={valueClass ?? "text-slate-300"}>{value}</span>
     </div>
   );
 }

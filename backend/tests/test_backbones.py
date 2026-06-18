@@ -26,6 +26,17 @@ def test_managed_tracker_falls_back_to_opencv_when_engine_absent():
         assert tracker.source == "opencv"  # graceful fallback keeps the lock alive
 
 
+def test_is_fallback_surfaces_silent_opencv_drop():
+    # A deep backbone was requested but OpenCV is actually running -> fallback.
+    deep = ManagedTracker({}, backbone="uetrack")
+    assert deep.is_fallback is True
+    assert deep.to_dict()["fallback"] is True
+    # Explicitly requesting opencv is not a "fallback" surprise.
+    plain = ManagedTracker({}, backbone="opencv")
+    assert plain.is_fallback is False
+    assert plain.to_dict()["fallback"] is False
+
+
 def test_managed_tracker_default_backbone_is_opencv():
     tracker = ManagedTracker({"samurai": {"use_video_predictor": False}})
     assert tracker.source == "opencv"

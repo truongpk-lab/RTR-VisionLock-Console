@@ -30,6 +30,11 @@ class EKFGate:
         thresholds = config.get("thresholds", {})
         ekf = config.get("motion", {}).get("ekf", {})
         self.max_error = float(thresholds.get("kalman_max_error", 80))
+        # Reject the ego-motion control input when the flow estimate is dominated
+        # by a moving object (low RANSAC inlier ratio): trusting a polluted (tx,ty)
+        # shifts the prediction and makes confidence wobble on a still target.
+        camera = config.get("motion", {}).get("camera", {})
+        self._min_cam_inlier_ratio = float(camera.get("min_inlier_ratio", 0.5))
         q_pos = float(ekf.get("q_pos", 1.0))
         q_vel = float(ekf.get("q_vel", 4.0))
         q_size = float(ekf.get("q_size", 0.5))
@@ -58,8 +63,14 @@ class EKFGate:
         self.P = self._P0.copy()
 
     def set_camera_motion(self, motion: Any) -> None:
-        """Stash the background (tx, ty) consumed by the next predict/update."""
-        if motion is not None and getattr(motion, "ok", False):
+        """Stash the background (tx, ty) consumed by the next predict/update.
+
+        A low inlier ratio means the flow was dominated by a moving object rather
+        than the static background, so the (tx, ty) is unreliable; in that case we
+        drop the control input and fall back to plain constant-velocity prediction.
+        """
+        ratio = float(getattr(motion, "inlier_ratio", 0.0)) if motion is not None else 0.0
+        if motion is not None and getattr(motion, "ok", False) and ratio >= self._min_cam_inlier_ratio:
             self._cam = np.array([float(motion.tx), float(motion.ty)], dtype=float)
         else:
             self._cam = np.zeros(2, dtype=float)

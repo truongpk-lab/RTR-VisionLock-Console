@@ -75,6 +75,7 @@ class OpenCVProposalDetector:
                     "negative_margin": 0.0,
                     "motion_score": 0.0,
                     "is_distractor": False,
+                    "mask_polygon": None,
                 }
             )
         return result
@@ -154,7 +155,12 @@ class YoloProposalDetector:
             classes = boxes.cls.cpu().numpy() if boxes.cls is not None else np.zeros(len(xyxy))
             for box, score, class_id in zip(xyxy, confs, classes):
                 detections.append((float(box[0]), float(box[1]), float(box[2]), float(box[3]), float(score), int(class_id)))
-            return self._build_candidates(detections, frame.shape[1], frame.shape[0], names)
+            # Segmentation models (e.g. yolo11n-seg) also return per-instance masks.
+            # Surface them as polygons (original image pixels) so the UI can colour
+            # the object; detection-only models leave masks None.
+            masks = getattr(result, "masks", None)
+            polygons = getattr(masks, "xy", None) if masks is not None else None
+            return self._build_candidates(detections, frame.shape[1], frame.shape[0], names, polygons)
         except Exception as exc:  # pragma: no cover - depends on deployment runtime
             self.last_error = str(exc)
             return self.fallback.detect(frame)
@@ -170,17 +176,39 @@ class YoloProposalDetector:
             return str(self.class_names[class_id])
         return f"class_{class_id}"
 
+    @staticmethod
+    def _simplify_polygon(poly: Any, max_points: int = 60) -> list[list[int]] | None:
+        """Down-sample a SAM/YOLO mask polygon to a small int point list for the UI."""
+        if poly is None:
+            return None
+        pts = np.asarray(poly, dtype=np.float32)
+        if pts.ndim != 2 or len(pts) < 3:
+            return None
+        if cv2 is not None and len(pts) > 6:
+            contour = pts.reshape(-1, 1, 2)
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            pts = approx.reshape(-1, 2)
+        if len(pts) > max_points:
+            step = int(np.ceil(len(pts) / max_points))
+            pts = pts[::step]
+        return [[int(round(x)), int(round(y))] for x, y in pts]
+
     def _build_candidates(
         self,
         detections: list[tuple[float, float, float, float, float, int | None]],
         width: int,
         height: int,
         names: dict | list | None = None,
+        polygons: Any = None,
     ) -> list[dict]:
         candidates = []
         for idx, (x1, y1, x2, y2, score, class_id) in enumerate(detections[: self.max_candidates]):
             bbox = clamp_bbox((int(round(x1)), int(round(y1)), int(round(x2 - x1)), int(round(y2 - y1))), width, height)
             track_id = f"Y{idx}"
+            mask_polygon = None
+            if polygons is not None and idx < len(polygons):
+                mask_polygon = self._simplify_polygon(polygons[idx])
             candidates.append(
                 {
                     "id": track_id,
@@ -196,6 +224,7 @@ class YoloProposalDetector:
                     "negative_margin": 0.0,
                     "motion_score": 0.0,
                     "is_distractor": False,
+                    "mask_polygon": mask_polygon,
                 }
             )
         return candidates

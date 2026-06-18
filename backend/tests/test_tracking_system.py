@@ -64,11 +64,109 @@ def test_redetect_requires_confirmation_before_relock():
     assert sess.target_bbox == BBOX
 
 
+def test_searching_clears_frozen_target_box():
+    """Lost target must not leave a frozen box: entering re-acquire clears
+    target_bbox/kalman_bbox so the snapshot (and UI) hides the stale overlay
+    until a confirmed re-lock re-populates it."""
+    sess = _locked_session()
+    assert sess.target_bbox == BBOX  # locked box is present before loss
+    sess.state = TrackingState.SEARCHING
+    sess.reacq.reset()
+    sess.frame = _frame()
+    sess.proposal.detect = lambda frame: []  # nothing to confirm -> stays searching
+
+    sess._run_reacquire(force=True)
+    assert sess.state == TrackingState.SEARCHING
+    assert sess.target_bbox is None
+    assert sess.kalman_bbox is None
+    snap = sess.snapshot(include_frame=False)
+    assert snap["target_bbox"] is None
+    assert snap["kalman_bbox"] is None
+
+
 def test_snapshot_exposes_confidence_and_memory_tiers():
     sess = TrackingSession()
     snap = sess.snapshot(include_frame=False)
     tracking = snap["tracking"]
     assert tracking["confidence_state"] in {"LOCKED", "UNCERTAIN", "LOST"}
     assert tracking["reacquire"]["need"] == sess.reacq.confirm_frames
+    # Fallback must be observable so the UI can warn the operator (A1).
+    assert isinstance(tracking["tracker_fallback"], bool)
+    assert isinstance(tracking["refind_fallback"], bool)
     memory = snap["memory"]
     assert "working_slots" in memory and "anchor_slots" in memory
+
+
+def test_snapshot_exposes_debug_block():
+    sess = _locked_session()
+    sess._frame_count = 1
+    sess.frame = _frame(190)
+    sess._update_tracking(sess.frame)
+    debug = sess.snapshot(include_frame=False)["debug"]
+    for key in (
+        "tracker_backend",
+        "tracker_fallback",
+        "proposal_source",
+        "lost_age_sec",
+        "negative_similarity",
+        "positive_negative_margin",
+        "reacquire_score",
+        "ego_motion_ok",
+    ):
+        assert key in debug
+    assert debug["proposal_source"] == "tracker_normal"
+    assert isinstance(debug["ego_motion_ok"], bool)
+
+
+def test_fallback_confidence_tracks_identity_not_just_jitter():
+    """A4a: OpenCV fallback confidence follows appearance identity, so SMOOTH
+    drift (low identity but low jitter) is no longer read as a solid lock."""
+
+    def run(identity_score):
+        sess = _locked_session()
+        assert sess.tracker.is_fallback  # torch-less dev box -> OpenCV fallback
+        sess.memory.score = lambda frame, bbox, s=identity_score: {
+            "positive_similarity": s,
+            "negative_similarity": 0.1,
+            "identity_score": s,
+            "negative_margin": s - 0.1,
+        }
+        sess._frame_count = 1
+        sess.frame = _frame(185)  # tiny move -> low jitter (stability stays high)
+        sess._update_tracking(sess.frame)
+        return sess.metrics.confidence
+
+    high = run(0.95)
+    low = run(0.20)
+    assert high > low  # identity, not jitter alone, drives fallback confidence
+    assert low <= 0.75  # fallback confidence is capped
+
+
+def test_widen_search_bbox_enlarges_around_centre():
+    """B1: REFIND seeds the re-find tracker on a wider box (same centre)."""
+    sess = TrackingSession()
+    frame = _frame()
+    box = (200, 150, 40, 60)
+    wide = sess._widen_search_bbox(box, frame)
+    assert wide[2] > box[2] and wide[3] > box[3]
+    assert abs((box[0] + box[2] / 2) - (wide[0] + wide[2] / 2)) <= 1  # centre held
+
+
+def test_fallback_drift_drops_state_and_freezes_memory():
+    """A4c + A2: with the OpenCV fallback running, low identity (drift) drops the
+    state out of LOCKED and stops the bank from learning the drifted crop."""
+    sess = _locked_session()
+    assert sess.tracker.is_fallback
+    sess.memory.score = lambda frame, bbox: {
+        "positive_similarity": 0.2,
+        "negative_similarity": 0.1,
+        "identity_score": 0.2,
+        "negative_margin": 0.1,
+    }
+    before = sess.memory.admitted_count
+    for i, x in enumerate([185, 195, 205, 215, 225, 235]):
+        sess._frame_count = i + 1
+        sess.frame = _frame(x)
+        sess._update_tracking(sess.frame)
+    assert sess.confidence.confidence_state != "LOCKED"  # drift detected, not hidden
+    assert sess.memory.admitted_count == before  # drifted crop never poisons memory
