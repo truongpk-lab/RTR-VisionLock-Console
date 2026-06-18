@@ -2,7 +2,7 @@ from app.vision.backbones import BACKBONE_REGISTRY, ManagedTracker, build_backbo
 
 
 def test_registry_exposes_all_tiers():
-    assert {"opencv", "sam2_video", "uetrack", "evptrack"} <= set(BACKBONE_REGISTRY)
+    assert {"opencv", "sam2_video", "uetrack", "uetrack_onnx"} <= set(BACKBONE_REGISTRY)
 
 
 def test_unknown_backbone_name_falls_back_to_opencv():
@@ -14,14 +14,14 @@ def test_unknown_backbone_name_falls_back_to_opencv():
 def test_deep_backbones_report_unavailable_without_torch():
     # On a machine without torch/weights, the deep adapters must not crash; they
     # report unavailable so the managed tracker can fall back.
-    for name in ("uetrack", "evptrack"):
+    for name in ("uetrack",):
         backbone = build_backbone(name, {})
         assert backbone.available is False
         assert backbone.last_error
 
 
 def test_managed_tracker_falls_back_to_opencv_when_engine_absent():
-    for name in ("uetrack", "evptrack", "sam2_video"):
+    for name in ("uetrack", "uetrack_onnx", "sam2_video"):
         tracker = ManagedTracker({}, backbone=name)
         assert tracker.source == "opencv"  # graceful fallback keeps the lock alive
 

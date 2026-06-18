@@ -53,8 +53,14 @@ class CameraSource:
             self.active = False
             return False
         if is_file:
-            file_fps = capture.get(cv2.CAP_PROP_FPS)
-            self._frame_interval = 1.0 / file_fps if file_fps and file_fps > 1.0 else 1.0 / 30.0
+            # Normally pace a file to its native FPS so it plays like a live feed.
+            # uncap_fps removes the pacing so the loop runs at the pipeline's true
+            # throughput -- used to benchmark max FPS from an imported video.
+            if bool(cfg.get("uncap_fps", False)):
+                self._frame_interval = 0.0
+            else:
+                file_fps = capture.get(cv2.CAP_PROP_FPS)
+                self._frame_interval = 1.0 / file_fps if file_fps and file_fps > 1.0 else 1.0 / 30.0
         else:
             self._frame_interval = 0.0
             # Device-only tuning; these properties are meaningless for a file and

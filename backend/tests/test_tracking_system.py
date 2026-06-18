@@ -92,7 +92,6 @@ def test_snapshot_exposes_confidence_and_memory_tiers():
     assert tracking["reacquire"]["need"] == sess.reacq.confirm_frames
     # Fallback must be observable so the UI can warn the operator (A1).
     assert isinstance(tracking["tracker_fallback"], bool)
-    assert isinstance(tracking["refind_fallback"], bool)
     memory = snap["memory"]
     assert "working_slots" in memory and "anchor_slots" in memory
 
@@ -142,16 +141,6 @@ def test_fallback_confidence_tracks_identity_not_just_jitter():
     assert low <= 0.75  # fallback confidence is capped
 
 
-def test_widen_search_bbox_enlarges_around_centre():
-    """B1: REFIND seeds the re-find tracker on a wider box (same centre)."""
-    sess = TrackingSession()
-    frame = _frame()
-    box = (200, 150, 40, 60)
-    wide = sess._widen_search_bbox(box, frame)
-    assert wide[2] > box[2] and wide[3] > box[3]
-    assert abs((box[0] + box[2] / 2) - (wide[0] + wide[2] / 2)) <= 1  # centre held
-
-
 def test_fallback_drift_drops_state_and_freezes_memory():
     """A4c + A2: with the OpenCV fallback running, low identity (drift) drops the
     state out of LOCKED and stops the bank from learning the drifted crop."""
@@ -170,3 +159,23 @@ def test_fallback_drift_drops_state_and_freezes_memory():
         sess._update_tracking(sess.frame)
     assert sess.confidence.confidence_state != "LOCKED"  # drift detected, not hidden
     assert sess.memory.admitted_count == before  # drifted crop never poisons memory
+
+
+def test_reid_cadence_skips_deep_between_intervals():
+    """P3: with reid_interval>1 the deep identity score runs only on cadence frames
+    (reid_on_uncertain off here to isolate the cadence from state dynamics)."""
+    sess = _locked_session()
+    sess.config.setdefault("identity", {})
+    sess.config["identity"]["reid_interval"] = 3
+    sess.config["identity"]["reid_on_uncertain"] = False
+    cached = {"positive_similarity": 0.9, "negative_similarity": 0.1,
+              "identity_score": 0.9, "negative_margin": 0.8}
+    calls = []
+    sess.memory.score = lambda frame, bbox: (calls.append(1), dict(cached))[1]
+    sess._last_identity = dict(cached)  # seed the cache so the first frame can skip
+    for i in range(1, 10):  # frame_count 1..9
+        sess._frame_count = i
+        sess.frame = _frame(180)
+        sess._update_tracking(sess.frame)
+    # Deep score runs only at frame_count 3, 6, 9 -> 3 of 9 frames.
+    assert len(calls) == 3

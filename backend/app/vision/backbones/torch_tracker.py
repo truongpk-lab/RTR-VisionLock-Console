@@ -189,18 +189,3 @@ class UETrackBackbone(StarkLineageBackbone):
     default_tracker_class = "UETrack"
     # Param name = experiments/uetrack/<name>.yaml in the repo: uetrack_tiny/small/base.
     default_param_name = "uetrack_tiny"
-
-
-class EVPTrackBackbone(StarkLineageBackbone):
-    """EVPTrack (AAAI 2024) — spatio-temporal explicit visual prompts.
-
-    Tier B low-confidence local re-find tracker; strong under appearance change /
-    deformation. See https://github.com/GXNU-ZhongLab/EVPTrack.
-    """
-
-    source = "evptrack"
-    config_key = "tracker_evptrack"
-    default_param_module = "lib.test.parameter.evptrack"
-    default_tracker_module = "lib.test.tracker.evptrack"
-    default_tracker_class = "EVPTrack"
-    default_param_name = "baseline"

@@ -1,10 +1,14 @@
-from app.vision.policy import ConfidenceManager, TrackMode
+from app.vision.policy import ConfidenceManager
 
 
-def _manager(**tracking):
+def _manager(**thresholds):
     config = {
-        "thresholds": {"stable_threshold": 0.70, "uncertain_threshold": 0.45, "lost_frames": 3},
-        "tracking": {"refind_after": 2, **tracking},
+        "thresholds": {
+            "stable_threshold": 0.70,
+            "uncertain_threshold": 0.45,
+            "lost_frames": 3,
+            **thresholds,
+        },
     }
     return ConfidenceManager(config)
 
@@ -18,8 +22,7 @@ def test_locked_allows_memory_and_no_detection():
 
 
 def test_uncertain_freezes_memory_and_no_detection():
-    manager = _manager(refind_after=1)
-    gate = manager.update(0.6, ok=True)
+    gate = _manager().update(0.6, ok=True)
     assert gate.confidence_state == "UNCERTAIN"
     assert gate.allow_memory_update is False
     assert gate.freeze_memory is True
@@ -36,26 +39,18 @@ def test_lost_enables_detection_only():
     assert gates[-1].run_detection == gates[-1].policy.reacquire
 
 
-def test_mode_passes_through_to_backbone_selection():
-    manager = _manager(refind_after=1)
-    manager.update(0.6, ok=True)  # -> REFIND
-    assert manager.mode == TrackMode.REFIND
-    manager.update(0.9, ok=True)  # -> NORMAL
-    assert manager.mode == TrackMode.NORMAL
-
-
 def test_configure_preserves_live_counters():
     manager = _manager()
     manager.update(0.0, ok=False)
     before = manager.policy.lost_count
-    manager.configure({"thresholds": {"stable_threshold": 0.5}, "tracking": {}})
+    manager.configure({"thresholds": {"stable_threshold": 0.5}})
     assert manager.policy.stable == 0.5
     assert manager.policy.lost_count == before
 
 
 def test_reset_returns_to_locked_state():
-    manager = _manager(refind_after=1)
+    manager = _manager()
     manager.update(0.0, ok=False)
     manager.reset()
     assert manager.confidence_state == "LOCKED"
-    assert manager.mode == TrackMode.NORMAL
+    assert manager.policy.lost_count == 0

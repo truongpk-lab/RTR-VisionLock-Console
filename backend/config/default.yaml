@@ -13,6 +13,9 @@ camera:
   fourcc: MJPG
   # Capture runs on its own thread and keeps only the newest frame, so frames
   # buffered while processing was busy are dropped automatically (flat latency).
+  # Imported video files normally play at their native FPS. Set true to drop that
+  # pacing and run the loop at full pipeline speed -- a throughput benchmark.
+  uncap_fps: false
 
 models:
   proposal:
@@ -50,15 +53,21 @@ models:
     tracker_module: lib.test.tracker.uetrack
     tracker_class: UETrack
     param_name: uetrack_tiny       # experiments/uetrack/<name>.yaml: tiny/small/base
-  # Tier B re-find tracker: EVPTrack-224 (AAAI 2024) spatio-temporal visual prompts.
-  tracker_evptrack:
+  # Optional accelerator: the UETrack network exported to ONNX and run via ONNX
+  # Runtime (TensorRT/CUDA EP builds & caches a per-device engine on first run).
+  # Build the .onnx once with tools/export_uetrack_onnx.py, then select it with
+  # tracking.normal_backbone: uetrack_onnx. Reuses the SAME repo for crop/decode
+  # pre/post. Missing onnxruntime/.onnx => falls back to OpenCV, so it stays opt-in.
+  tracker_uetrack_onnx:
     enabled: true
-    repo_path: ""                  # absolute path to the cloned EVPTrack repo
-    checkpoint: models/evptrack.pth
-    param_module: lib.test.parameter.evptrack
-    tracker_module: lib.test.tracker.evptrack
-    tracker_class: EVPTrack
-    param_name: baseline           # EVPTrack-224 (input 224) for speed
+    repo_path: ""                  # same cloned UETrack repo (reused for pre/post)
+    checkpoint: models/uetrack_tiny_rgb.pth
+    onnx_path: models/uetrack_tiny_rgb.onnx
+    param_name: uetrack_tiny_rgb
+    fp16: true                     # TensorRT EP FP16 (2-4x on Jetson)
+    engine_cache_dir: models/trt_cache
+    # Jetson order; on a CPU-only onnxruntime the unavailable EPs are skipped.
+    providers: [TensorrtExecutionProvider, CUDAExecutionProvider, CPUExecutionProvider]
 
 selection:
   # YOLO-first selection is the default: detector boxes are shown first, then
@@ -131,22 +140,13 @@ runtime:
   queue_size: 2
 
 tracking:
-  # 3-tier confidence-gated tracking layer (LTMU-style meta-updater), see
-  # app/vision/policy.py. Each tier's backbone is selected by name from
+  # 2-tier confidence-gated tracking layer (LTMU-style meta-updater), see
+  # app/vision/policy.py. The local backbone is selected by name from
   # app/vision/backbones and falls back to OpenCV when a deep engine is absent,
   # so a dev box without torch still runs end-to-end.
-  #   confidence HIGH -> normal_backbone   (Tier A, fast local track)
-  #   confidence LOW  -> refind_backbone   (Tier B, local re-find)
-  #   target LOST     -> global YOLO+ReID re-detect (Tier C, reacquire_threshold)
+  #   confidence HIGH/LOW -> normal_backbone (Tier A, local track; re-searches itself)
+  #   target LOST         -> global YOLO+ReID re-detect (Tier C, reacquire_threshold)
   normal_backbone: uetrack
-  refind_backbone: evptrack
-  # Consecutive sub-stable (but not lost) frames before handing A -> B. Higher =
-  # more patient on the strong tracker before switching to the re-find tracker.
-  refind_after: 2
-  # Entering REFIND seeds the re-find tracker on a box enlarged by this factor, to
-  # widen the local search before the loss escalates to a full global re-detect.
-  # 1.0 disables the widening (seed on the exact last box).
-  wide_search_scale: 1.5
 
 motion:
   # Camera ego-motion compensation: sparse LK optical flow on background features
@@ -202,6 +202,13 @@ identity:
   encoder: hsv_block_texture
   min_margin: 0.12
   negative_slots: 8
+  # Deep ReID identity is the per-frame cost. Run the full identity score every Nth
+  # tracking frame (1 = every frame, unchanged); between, reuse the cached score and
+  # skip memory writes. Drift is then re-checked at most reid_interval frames later.
+  reid_interval: 1
+  # Always run a fresh score when not STABLE, so a confidence dip re-confirms identity
+  # immediately instead of waiting for the cadence.
+  reid_on_uncertain: true
   # Optional deep ReID embedding to separate genuine look-alikes. Set
   # encoder: fused to enable (needs the ONNX model below + onnxruntime, which is
   # in the base install). Missing model -> automatic fallback to the handcrafted

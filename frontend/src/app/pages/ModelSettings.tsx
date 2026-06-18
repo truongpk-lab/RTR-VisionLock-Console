@@ -40,7 +40,6 @@ export function ModelSettings() {
           fields: [
             { path: ["models", "segmenter", "enabled"], label: "Segmenter enabled", kind: "bool" },
             { path: ["models", "tracker_uetrack", "enabled"], label: "UETrack (Tier A) enabled", kind: "bool" },
-            { path: ["models", "tracker_evptrack", "enabled"], label: "EVPTrack (Tier B) enabled", kind: "bool" },
             { path: ["runtime", "refine_during_tracking"], label: "SAM2 refine while tracking", kind: "bool", hint: "Tắt để tăng FPS (UETrack bám bằng box)" },
           ],
         },

@@ -1,0 +1,108 @@
+digraph VisionLockOverview {
+  rankdir=TB;
+  bgcolor="#0b0f17";
+  fontname="DejaVu Sans";
+  fontcolor="#e5ecf5";
+  labelloc="t";
+  fontsize=26;
+  label="RTR · VisionLock Console — Kiến trúc tổng thể & Luồng trạng thái (Frontend ↔ Backend)";
+  nodesep=0.35;
+  ranksep=0.65;
+  splines=spline;
+  compound=true;
+  node [fontname="DejaVu Sans", fontsize=11, color="#3a4a63", fontcolor="#e5ecf5", penwidth=1.3];
+  edge [fontname="DejaVu Sans", fontsize=9, color="#5b7089", fontcolor="#9fb3c8", penwidth=1.2, arrowsize=0.7];
+
+  /* ===================== FRONTEND ===================== */
+  subgraph cluster_fe {
+    label="FRONTEND  ·  React + TypeScript  (Electron / Browser)";
+    fontsize=15; fontcolor="#7fd1ff"; color="#1f3a5f"; style="rounded,filled"; fillcolor="#0e1726"; penwidth=2;
+
+    fe_dash   [label="LiveDashboard\n(trang chính)", shape=box, style="rounded,filled", fillcolor="#13243b"];
+    fe_left   [label="LeftPanel\nĐiều khiển camera / chọn target /\nreset · force re-acquire · text prompt", shape=box, style="rounded,filled", fillcolor="#13243b"];
+    fe_view   [label="CameraViewport\nKhung hình + overlay\n(mask · candidate · reticle · Kalman box)\nclick / kéo box", shape=box, style="rounded,filled", fillcolor="#13243b"];
+    fe_right  [label="RightPanel + Topbar + BottomConsole\nMetrics · trạng thái · memory · log · timeline", shape=box, style="rounded,filled", fillcolor="#13243b"];
+
+    subgraph cluster_cfg {
+      label="Trang cấu hình  (ConfigForm + slider)";
+      fontsize=11; fontcolor="#a0e6c0"; color="#1d4a36"; style="rounded,filled"; fillcolor="#0c1b16";
+      cfg_thr [label="ThresholdConfig\nngưỡng FSM", shape=box, style="rounded,filled", fillcolor="#12241c"];
+      cfg_mem [label="MemoryConfig\nbanks + SAMURAI", shape=box, style="rounded,filled", fillcolor="#12241c"];
+      cfg_rea [label="ReacquireConfig\ndetect/confirm/weights", shape=box, style="rounded,filled", fillcolor="#12241c"];
+      cfg_mod [label="ModelSettings\nYOLO/SAM2/tracker", shape=box, style="rounded,filled", fillcolor="#12241c"];
+    }
+    fe_ctx [label="lib/trackingSession.tsx  +  lib/api.ts\nSession context · gộp state · build URL/WS", shape=box, style="rounded,filled", fillcolor="#102033", fontcolor="#7fd1ff"];
+  }
+
+  fe_left -> fe_ctx [style=dotted, color="#3a4a63"];
+  fe_view -> fe_ctx [style=dotted, color="#3a4a63"];
+  cfg_thr -> fe_ctx [style=invis];
+  fe_dash -> fe_left [style=invis];
+
+  /* ===================== TRANSPORT ===================== */
+  subgraph cluster_net {
+    label="LỚP TRUYỀN  ·  HTTP REST  +  WebSocket";
+    fontsize=14; fontcolor="#ffcf8f"; color="#5a3d12"; style="rounded,filled"; fillcolor="#1a130a"; penwidth=2;
+
+    ws  [label="WS  /ws/session   ◀── ~20 Hz\nSessionSnapshot: frame(JPEG b64) · state ·\nbboxes · mask · candidates · metrics · memory · logs", shape=box, style="rounded,filled", fillcolor="#241a0e", fontcolor="#ffcf8f"];
+    rest [label="REST  /api/*   ──▶\ncamera/{start,stop,upload}  ·  target/{select,segment,box,pick,lock}\ntracking/reset  ·  reacquire/force  ·  prompt/apply\nconfig {GET, PATCH, /save}", shape=box, style="rounded,filled", fillcolor="#241a0e", fontcolor="#ffcf8f"];
+  }
+
+  fe_ctx -> rest [label="user actions (POST/PATCH)", color="#c98a2e", fontcolor="#ffcf8f"];
+  ws -> fe_ctx   [label="stream state mỗi frame", color="#c98a2e", fontcolor="#ffcf8f"];
+  cfg_mod -> rest [label="GET/PATCH config", style=dashed, color="#3a8f5f", fontcolor="#a0e6c0"];
+
+  /* ===================== BACKEND ===================== */
+  subgraph cluster_be {
+    label="BACKEND  ·  FastAPI  (app/main.py)";
+    fontsize=15; fontcolor="#ff9a9a"; color="#5f1f1f"; style="rounded,filled"; fillcolor="#160d0d"; penwidth=2;
+
+    api [label="FastAPI router + WebSocket\nnhận lệnh → gọi TrackingSession → trả snapshot", shape=box, style="rounded,filled", fillcolor="#241313", fontcolor="#ff9a9a"];
+
+    subgraph cluster_sess {
+      label="core/session.py  ·  TrackingSession  (luồng nền _loop)";
+      fontsize=12; fontcolor="#e5ecf5"; color="#3a4a63"; style="rounded,filled"; fillcolor="#0f1622";
+
+      cam [label="vision/camera.py · CameraSource\nthread _reader() đọc MJPG/file →\ngiữ frame mới nhất (không dồn)", shape=box, style="rounded,filled", fillcolor="#13243b"];
+      disp [label="_dispatch_frame()\nrẽ nhánh theo state", shape=diamond, style="filled", fillcolor="#1b2740", fontcolor="#cfe3ff", height=1.1];
+    }
+  }
+
+  rest -> api [color="#c0504d"];
+  api  -> ws  [label="snapshot()", style=dashed, color="#c0504d", fontcolor="#ff9a9a"];
+  api  -> cam [label="start/stop camera"];
+  cam  -> disp [label="frame mới"];
+
+  /* ===================== STATE MACHINE ===================== */
+  subgraph cluster_fsm {
+    label="MÁY TRẠNG THÁI THEO DÕI  (vòng đời 1 target)";
+    fontsize=14; fontcolor="#cfe3ff"; color="#2a3f63"; style="rounded,filled"; fillcolor="#0d1422"; penwidth=2;
+
+    s_ready  [label="CAMERA_READY", shape=box, style="rounded,filled", fillcolor="#16314f", fontcolor="#bfe0ff"];
+    s_cand   [label="CANDIDATE_TRACKING\nYOLO detect + mini-tracker\n(_update_candidates)", shape=box, style="rounded,filled", fillcolor="#16314f"];
+    s_learn  [label="LEARNING_TARGET\nthu mẫu đặc trưng ~2.5s\n(_update_learning)", shape=box, style="rounded,filled", fillcolor="#173b2a", fontcolor="#a8efc6"];
+    s_lock   [label="LOCKED_TRACKING / STABLE\nTier A — UETrack\n(_update_tracking)", shape=box, style="rounded,filled,bold", fillcolor="#0f3d3a", fontcolor="#7fffe6", penwidth=2.4];
+    s_unc    [label="UNCERTAIN / REFIND\nTier B — EVPTrack\n(memory đóng băng)", shape=box, style="rounded,filled", fillcolor="#3d3410", fontcolor="#ffe08a"];
+    s_lost   [label="LOST / SEARCHING\nTier C — re-detect\n(_run_reacquire)", shape=box, style="rounded,filled", fillcolor="#42171a", fontcolor="#ff9aa2"];
+    s_reacq  [label="REACQUIRED\nxác nhận ≥ N frame liên tiếp", shape=box, style="rounded,filled", fillcolor="#16314f", fontcolor="#bfe0ff"];
+
+    s_ready -> s_cand  [label="select / segment / box"];
+    s_cand  -> s_learn [label="pick_target / lock"];
+    s_cand  -> s_learn [label="select_box (kéo box)", style=dashed];
+    s_learn -> s_lock  [label="đủ thời gian + ≥ min_samples\n_finalize_lock()"];
+    s_lock  -> s_lock  [label="score ≥ stable_threshold", color="#3a8f7f"];
+    s_lock  -> s_unc   [label="uncertain ≤ score < stable", color="#b59a3a"];
+    s_unc   -> s_lock  [label="score phục hồi", color="#3a8f7f"];
+    s_unc   -> s_lost  [label="lost_frames /\nidentity_lost_frames", color="#c0504d"];
+    s_lock  -> s_lost  [label="score < uncertain", color="#c0504d"];
+    s_lost  -> s_reacq [label="ConfirmationBuffer OK"];
+    s_reacq -> s_lock  [label="re-lock"];
+    s_lost  -> s_lost  [label="detect_hz (3→1 Hz theo lost_age)", color="#7a3030"];
+  }
+
+  disp -> s_ready [ltail=cluster_sess, lhead=cluster_fsm, label="theo state hiện tại", color="#5b7089"];
+
+  /* ===================== CONFIG influence ===================== */
+  cfg_thr -> s_lock [style=invis];
+  rest -> cluster_fsm [style=invis];
+}

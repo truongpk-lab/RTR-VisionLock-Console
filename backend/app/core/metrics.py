@@ -27,6 +27,11 @@ def track_score(
 class MetricState:
     fps: float = 0.0
     latency_ms: float = 0.0
+    # Per-stage timing of the hot path (ms), to find the FPS bottleneck on-device.
+    tracker_ms: float = 0.0
+    reid_ms: float = 0.0
+    flow_ms: float = 0.0
+    encode_ms: float = 0.0
     gpu: str = "N/A"
     camera: str = "OFFLINE"
     track_score: float = 0.0
@@ -41,6 +46,10 @@ class MetricState:
         return {
             "fps": round(self.fps, 1),
             "latency_ms": round(self.latency_ms, 1),
+            "tracker_ms": round(self.tracker_ms, 2),
+            "reid_ms": round(self.reid_ms, 2),
+            "flow_ms": round(self.flow_ms, 2),
+            "encode_ms": round(self.encode_ms, 2),
             "gpu": self.gpu,
             "camera": self.camera,
             "track_score": round(self.track_score, 3),

@@ -22,7 +22,7 @@ from app.vision.ekf import EKFGate
 from app.vision.flow import CameraMotionEstimator
 from app.vision.memory import MemoryBank
 from app.vision.backbones import ManagedTracker
-from app.vision.policy import ConfidenceManager, TrackMode
+from app.vision.policy import ConfidenceManager
 from app.vision.proposal import build_proposal_detector
 from app.vision.reacquire import ReAcquireEngine
 from app.vision.reacquire_controller import ReacquisitionController
@@ -49,12 +49,10 @@ class TrackingSession:
         self.reacquire = ReAcquireEngine(self.config, self.memory, self.kalman)
         # Stateful long-term tracking system. The tracker is just a module; the
         # deciding parts are confidence state + memory bank + global re-detection:
-        #   Tier A NORMAL (LOCKED)    -> self.tracker        (high-confidence local track)
-        #   Tier B REFIND (UNCERTAIN) -> self.refind_tracker (low-confidence local re-find)
-        #   Tier C LOST               -> self.reacq          (global YOLO+ReID, confirm then re-lock)
+        #   Tier A (LOCKED/UNCERTAIN) -> self.tracker  (local track; re-searches itself)
+        #   Tier C LOST               -> self.reacq    (global YOLO+ReID, confirm then re-lock)
         # Detection is OFF while tracking; it only runs when the manager says LOST.
         self.tracker = self._new_normal_tracker()
-        self.refind_tracker = self._new_refind_tracker()
         self.confidence = ConfidenceManager(self.config)
         self.reacq = ReacquisitionController(self.config, self.memory, self.reacquire)
         self._last_good_bbox: BBox | None = None
@@ -107,13 +105,8 @@ class TrackingSession:
             self.timeline = self.timeline[-80:]
 
     def _new_normal_tracker(self) -> ManagedTracker:
-        """Tier A backbone (default UETrack-B; falls back to OpenCV when absent)."""
+        """Tier A backbone (default UETrack; falls back to OpenCV when absent)."""
         name = self.config.get("tracking", {}).get("normal_backbone", "uetrack")
-        return ManagedTracker(self.config, backbone=name)
-
-    def _new_refind_tracker(self) -> ManagedTracker:
-        """Tier B backbone (default EVPTrack; falls back to OpenCV when absent)."""
-        name = self.config.get("tracking", {}).get("refind_backbone", "evptrack")
         return ManagedTracker(self.config, backbone=name)
 
     def _log_tracker_backend(self, tracker: ManagedTracker, tier: str) -> None:
@@ -164,7 +157,6 @@ class TrackingSession:
             self.candidates = []
             self._clear_selection_state()
             self.tracker = self._new_normal_tracker()
-            self.refind_tracker = self._new_refind_tracker()
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
@@ -302,7 +294,6 @@ class TrackingSession:
     def reset_tracking(self) -> dict:
         with self._lock:
             self.tracker = self._new_normal_tracker()
-            self.refind_tracker = self._new_refind_tracker()
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
@@ -514,6 +505,7 @@ class TrackingSession:
                 now = time.perf_counter()
                 if now - self._last_encode_at >= encode_interval:
                     self._encode_frame(frame)
+                    self.metrics.encode_ms = (time.perf_counter() - now) * 1000.0
                     self._last_encode_at = now
                 dt = max(1e-6, now - self._last_loop_at)
                 self._last_loop_at = now
@@ -659,10 +651,6 @@ class TrackingSession:
         bbox = clamp_bbox(bbox, width, height)
         self.tracker = self._new_normal_tracker()
         ok = self.tracker.init(frame, bbox)
-        # Seed the Tier B re-find tracker on the same lock so it already holds the
-        # target template and can take over instantly when confidence drops.
-        self.refind_tracker = self._new_refind_tracker()
-        self.refind_tracker.init(frame, bbox)
         self.confidence.on_lock()
         self.reacq.reset()
         self.camera_motion.reset()
@@ -688,7 +676,6 @@ class TrackingSession:
         self.state = TrackingState.LOCKED_TRACKING
         self.log("Core", "SUCCESS", "Target locked. State -> LOCKED_TRACKING.")
         self._log_tracker_backend(self.tracker, "Tier A normal")
-        self._log_tracker_backend(self.refind_tracker, "Tier B re-find")
 
     def _update_tracking(self, frame) -> None:
         if self.state not in {
@@ -701,20 +688,25 @@ class TrackingSession:
             return
         # Camera ego-motion compensation runs every frame (before update/predict)
         # so the EKF tracks the target independent of camera shake/pan.
+        _t_flow = time.perf_counter()
         ego = self.camera_motion.estimate(frame, self.target_bbox, self._frame_count)
+        self.metrics.flow_ms = (time.perf_counter() - _t_flow) * 1000.0
         self._ego_motion = ego
         self.kalman.set_camera_motion(ego)
-        # Run ONLY the active tier's local tracker (normal in LOCKED, re-find in
-        # UNCERTAIN). Detection stays OFF here; Tier C re-detect handles loss.
-        tracker = self.tracker if self.confidence.mode == TrackMode.NORMAL else self.refind_tracker
-        self._proposal_source = "tracker_normal" if self.confidence.mode == TrackMode.NORMAL else "tracker_refind"
+        # Run the single local tracker (Tier A). It re-searches a window around the
+        # last position itself; detection stays OFF here, Tier C re-detect handles loss.
+        tracker = self.tracker
+        self._proposal_source = "tracker_normal"
+        _t_track = time.perf_counter()
         result = tracker.track(frame)
+        self.metrics.tracker_ms = (time.perf_counter() - _t_track) * 1000.0
         ok, bbox = result.ok, result.bbox
 
         identity: dict | None = None
         identity_lost = False
         motion_consistency = 0.0
         mask_quality = 0.0
+        fresh_reid = False
         if not ok or bbox is None:
             score = 0.0
             self.metrics.confidence = 0.0
@@ -722,7 +714,25 @@ class TrackingSession:
             height, width = frame.shape[:2]
             bbox = clamp_bbox(bbox, width, height)
             error, motion_consistency = self.kalman.update(bbox)
-            identity = self.memory.score(frame, bbox)
+            # Deep ReID is the per-frame bottleneck. Run the full identity score on a
+            # cadence (reid_interval) and reuse the cached score in between; always run
+            # fresh when not STABLE so a confidence dip re-confirms identity at once.
+            reid_cfg = self.config.get("identity", {})
+            reid_interval = max(1, int(reid_cfg.get("reid_interval", 1)))
+            reid_on_uncertain = bool(reid_cfg.get("reid_on_uncertain", True))
+            fresh_reid = (
+                reid_interval <= 1
+                or self._frame_count % reid_interval == 0
+                or self._last_identity is None
+                or (reid_on_uncertain and self.confidence.confidence_state != "LOCKED")
+            )
+            if fresh_reid:
+                _t_reid = time.perf_counter()
+                identity = self.memory.score(frame, bbox)
+                self.metrics.reid_ms = (time.perf_counter() - _t_reid) * 1000.0
+            else:
+                identity = self._last_identity
+                self.metrics.reid_ms = 0.0
             self._last_identity = identity
             similarity = identity["identity_score"]
             stability = self._confidence_from_jitter(bbox)
@@ -773,13 +783,13 @@ class TrackingSession:
             self.metrics.track_score = score
 
         gate = self.confidence.update(score, ok, identity_lost)
-        self._apply_mode_transition(frame, gate.policy, bbox if ok else None)
 
         # Memory bank is tier-gated by the confidence manager: learn only on an
         # unambiguous LOCKED frame (SAMURAI admission still guards look-alikes),
         # then pace working/long-term consolidation. UNCERTAIN freezes the bank;
-        # LOST never writes.
-        if gate.allow_memory_update and ok and identity is not None:
+        # LOST never writes. ``fresh_reid`` keeps the bank off cadence-skipped frames
+        # so a stale cached score can never drive admission/consolidation.
+        if gate.allow_memory_update and ok and identity is not None and fresh_reid:
             admission = self.memory.consider_update(
                 frame, bbox, motion_consistency, affinity=mask_quality, scores=identity
             )
@@ -791,36 +801,6 @@ class TrackingSession:
         self.state = gate.policy.state
         if gate.run_detection:
             self._run_reacquire()
-
-    def _widen_search_bbox(self, bbox: BBox, frame) -> BBox:
-        """Enlarge a box around its centre to widen the local re-find search.
-
-        Entering REFIND means the target is slipping; seeding the re-find tracker
-        on a larger region gives it more room to re-capture a target that has moved,
-        before the loss escalates to a full global re-detect.
-        """
-        scale = float(self.config.get("tracking", {}).get("wide_search_scale", 1.5))
-        if scale <= 1.0:
-            return bbox
-        x, y, w, h = bbox
-        cx, cy = x + w / 2.0, y + h / 2.0
-        nw, nh = w * scale, h * scale
-        height, width = frame.shape[:2]
-        return clamp_bbox((int(cx - nw / 2.0), int(cy - nh / 2.0), int(nw), int(nh)), width, height)
-
-    def _apply_mode_transition(self, frame, decision, current_bbox: BBox | None) -> None:
-        """Swap the active backbone when the policy crosses a tier boundary."""
-        if decision.seed_refind:
-            seed = current_bbox or self._last_good_bbox or self.kalman.predict()
-            if seed is not None:
-                seed = self._widen_search_bbox(seed, frame)
-                self.refind_tracker = self._new_refind_tracker()
-                if self.refind_tracker.init(frame, seed):
-                    self.log("Tracker", "INFO", f"Confidence low -> wide re-find via {self.refind_tracker.source} (Tier B).")
-        if decision.reinit_normal and self._last_good_bbox is not None:
-            self.tracker = self._new_normal_tracker()
-            self.tracker.init(frame, self._last_good_bbox)
-            self.log("Tracker", "INFO", f"Recovered -> normal track via {self.tracker.source} (Tier A).")
 
     def _log_state_transition(self, state: TrackingState, score: float) -> None:
         if state == TrackingState.STABLE:
@@ -949,8 +929,6 @@ class TrackingSession:
             bbox = tuple(outcome.bbox)
             self.tracker = self._new_normal_tracker()
             self.tracker.init(self.frame, bbox)
-            self.refind_tracker = self._new_refind_tracker()
-            self.refind_tracker.init(self.frame, bbox)
             self._log_tracker_backend(self.tracker, "Tier A normal")
             self.confidence.on_lock()
             self.reacq.reset()
@@ -1043,12 +1021,9 @@ class TrackingSession:
                 "segmenter": self.segmenter.to_dict(),
                 "tracker": self.tracker.to_dict() if hasattr(self.tracker, "to_dict") else {"source": "unknown"},
                 "tracking": {
-                    "mode": self.confidence.mode.value,
                     "confidence_state": self.confidence.confidence_state,
                     "normal_backbone": self.tracker.source,
-                    "refind_backbone": self.refind_tracker.source,
                     "tracker_fallback": self.tracker.is_fallback,
-                    "refind_fallback": self.refind_tracker.is_fallback,
                     "reacquire": {
                         "confirming": self.reacq.confirming,
                         "need": self.reacq.confirm_frames,
@@ -1073,8 +1048,6 @@ class TrackingSession:
         return {
             "tracker_backend": self.tracker.source,
             "tracker_fallback": self.tracker.is_fallback,
-            "refind_backend": self.refind_tracker.source,
-            "refind_fallback": self.refind_tracker.is_fallback,
             "proposal_source": self._proposal_source,
             "lost_age_sec": round(time.monotonic() - self._lost_since, 2) if self._lost_since else 0.0,
             "negative_similarity": float(identity.get("negative_similarity", 0.0)),

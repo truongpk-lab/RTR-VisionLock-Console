@@ -19,13 +19,14 @@ from ..utils import BBox, clamp_bbox
 from .base import TrackResult, TrackerBackbone
 from .opencv import OpenCvBackbone
 from .sam2_video import Sam2VideoBackbone
-from .torch_tracker import EVPTrackBackbone, UETrackBackbone
+from .torch_tracker import UETrackBackbone
+from .uetrack_onnx import UETrackOnnxBackbone
 
 BACKBONE_REGISTRY: dict[str, Callable[[dict[str, Any]], TrackerBackbone]] = {
     "opencv": OpenCvBackbone,
     "sam2_video": Sam2VideoBackbone,
     "uetrack": UETrackBackbone,
-    "evptrack": EVPTrackBackbone,
+    "uetrack_onnx": UETrackOnnxBackbone,
 }
 
 

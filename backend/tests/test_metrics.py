@@ -1,4 +1,11 @@
-from app.core.metrics import clamp, track_score
+from app.core.metrics import MetricState, clamp, track_score
+
+
+def test_metric_state_exposes_per_stage_timers():
+    metrics = MetricState()
+    for field in ("tracker_ms", "reid_ms", "flow_ms", "encode_ms"):
+        assert getattr(metrics, field) == 0.0
+        assert field in metrics.to_dict()
 
 
 def test_clamp_bounds_values():

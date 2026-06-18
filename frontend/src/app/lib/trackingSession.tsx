@@ -62,20 +62,15 @@ export interface SessionLog {
 }
 
 export interface SessionTracking {
-  mode: string;
   confidence_state: "LOCKED" | "UNCERTAIN" | "LOST";
   normal_backbone: string;
-  refind_backbone: string;
   tracker_fallback: boolean;
-  refind_fallback: boolean;
   reacquire: { confirming: number; need: number; detect_hz: number };
 }
 
 export interface SessionDebug {
   tracker_backend: string;
   tracker_fallback: boolean;
-  refind_backend: string;
-  refind_fallback: boolean;
   proposal_source: string;
   lost_age_sec: number;
   negative_similarity: number;

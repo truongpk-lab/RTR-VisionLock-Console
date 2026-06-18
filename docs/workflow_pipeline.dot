@@ -1,0 +1,107 @@
+digraph VisionLockPipeline {
+  rankdir=TB;
+  bgcolor="#0b0f17";
+  fontname="DejaVu Sans";
+  fontcolor="#e5ecf5";
+  labelloc="t";
+  fontsize=24;
+  label="RTR · VisionLock Console — Pipeline xử lý từng frame  (lõi _update_tracking · Memory · Re-acquire)";
+  nodesep=0.3;
+  ranksep=0.5;
+  splines=spline;
+  compound=true;
+  node [fontname="DejaVu Sans", fontsize=10.5, color="#3a4a63", fontcolor="#e5ecf5", penwidth=1.3, shape=box, style="rounded,filled", fillcolor="#13243b"];
+  edge [fontname="DejaVu Sans", fontsize=9, color="#5b7089", fontcolor="#9fb3c8", penwidth=1.3, arrowsize=0.7];
+
+  in [label="Frame T  (camera.read())\ngiữ frame mới nhất, thread-safe", shape=parallelogram, fillcolor="#16314f", fontcolor="#bfe0ff"];
+
+  /* ===================== TIER SELECTION ===================== */
+  tier [label="Chọn Tier theo ConfidenceManager\nNORMAL → tracker (Tier A)   ·   REFIND → refind_tracker (Tier B)", shape=diamond, fillcolor="#1b2740", fontcolor="#cfe3ff", height=1.0];
+
+  /* ===================== CORE LOOP (numbered) ===================== */
+  subgraph cluster_core {
+    label="LÕI THEO DÕI  ·  _update_tracking(frame)   (mỗi frame, theo thứ tự)";
+    fontsize=14; fontcolor="#7fffe6"; color="#0f3d3a"; style="rounded,filled"; fillcolor="#0a1a18"; penwidth=2;
+
+    p1 [label="① Ước lượng chuyển động camera (ego-motion)\nflow.py · goodFeaturesToTrack → calcOpticalFlowPyrLK\n→ RANSAC affine → CameraMotion(tx,ty,scale,inlier)"];
+    p2 [label="② Tracker.track(frame)\nUETrack / EVPTrack / SAM2 / OpenCV(fallback)\n→ TrackResult(ok, bbox, affinity, mask)"];
+    p3 [label="③ EKF cập nhật + dự đoán  (ekf.py)\nstate=[cx,cy,vx,vy,w,h] · predict cộng ego(tx,ty)\n→ error, motion_consistency · kalman_bbox (frame kế)"];
+    p4 [label="④ Chấm điểm danh tính  (memory.score)\nencode crop → cosine sim với RAM+WRM+DRM\n→ identity_score · negative_margin"];
+    p5 [label="⑤ Ước lượng confidence của tracker\ndeep: 0.5·stability+0.5·affinity\nfallback OpenCV: cap ≤ 0.75"];
+    p6 [label="⑥ (tùy chọn) Tinh chỉnh mask SAM2\nmỗi refine_interval frame · nếu quality ≥ mask_iou\n→ thay bbox  (mặc định TẮT khi tracking)", fillcolor="#102a26"];
+    p7 [label="⑦ Track score tổng hợp\n0.35·conf + 0.25·sim + 0.20·motion\n+ 0.20·mask − 0.25·neg_penalty\nDRIFT CATCH: sim < min_similarity → hạ điểm", fillcolor="#173b2a", fontcolor="#a8efc6"];
+
+    p1 -> p2 -> p3 -> p4 -> p5 -> p6 -> p7;
+  }
+
+  in -> tier;
+  tier -> p1 [lhead=cluster_core];
+
+  /* ===================== FSM DECISION ===================== */
+  subgraph cluster_fsm {
+    label="⑧ FSM tin cậy  ·  policy.py · confidence.update(score, ok, identity_lost)";
+    fontsize=13; fontcolor="#cfe3ff"; color="#2a3f63"; style="rounded,filled"; fillcolor="#0d1422"; penwidth=2;
+
+    d_stable [label="STABLE\nscore ≥ stable_threshold (0.70)\n→ Tier A · cho update memory", fillcolor="#0f3d3a", fontcolor="#7fffe6"];
+    d_unc    [label="UNCERTAIN → REFIND\nuncertain ≤ score < stable\nsau refind_after frame · ĐÓNG BĂNG memory", fillcolor="#3d3410", fontcolor="#ffe08a"];
+    d_lost   [label="LOST\nscore < uncertain (5 frame) hoặc\nidentity_lost ≥ 12 frame → bật detect", fillcolor="#42171a", fontcolor="#ff9aa2"];
+  }
+  p7 -> d_stable [lhead=cluster_fsm, label="gate = confidence.update(...)"];
+
+  /* mode transitions */
+  d_unc  -> tier [label="seed_refind: init Tier B (box mở rộng)", style=dashed, color="#b59a3a", constraint=false];
+  d_stable -> tier [label="reinit_normal khi quay lại NORMAL", style=dashed, color="#3a8f7f", constraint=false];
+
+  /* ===================== MEMORY ===================== */
+  subgraph cluster_mem {
+    label="MEMORY BANK  ·  vision/memory.py + encoders.py   (cập nhật khi STABLE — cổng SAMURAI)";
+    fontsize=13; fontcolor="#a0e6c0"; color="#1d4a36"; style="rounded,filled"; fillcolor="#0c1b16"; penwidth=2;
+
+    enc  [label="encoders.py · trích đặc trưng\nhsv_block_texture (mặc định) / hsv_shape / deep_onnx\n→ vector L2-norm", fillcolor="#12241c"];
+    gate [label="consider_update() — cổng SAMURAI\nkiểm: affinity · identity · motion · IoU distractor\n→ admit?", shape=diamond, fillcolor="#13301f", fontcolor="#a8efc6", height=1.0];
+
+    ram [label="RAM\nngắn hạn\n(mỗi frame STABLE)", shape=cylinder, fillcolor="#14352a", fontcolor="#bdf0d4"];
+    wrm [label="WRM\nlàm việc\n(promote mỗi N frame)", shape=cylinder, fillcolor="#123a2e", fontcolor="#bdf0d4"];
+    drm [label="DRM\ndài hạn — NEO re-detect\n(seed lúc lock, ít đổi)", shape=cylinder, fillcolor="#0f4034", fontcolor="#9affd0"];
+    neg [label="NEG\ndistractor\n(âm tính)", shape=cylinder, fillcolor="#3a1a1a", fontcolor="#ffb3b3"];
+
+    enc -> gate;
+    gate -> ram [label="admit → consolidate"];
+    ram -> wrm [label="working_promote_every"];
+    wrm -> drm [label="hợp nhất dài hạn"];
+  }
+
+  p4 -> enc [style=dotted, color="#3a8f5f", label="score dùng RAM+WRM+DRM", constraint=false];
+  d_stable -> gate [label="allow_memory_update", color="#3a8f5f", fontcolor="#a0e6c0"];
+
+  /* ===================== REACQUIRE ===================== */
+  subgraph cluster_reacq {
+    label="RE-ACQUIRE  ·  reacquire.py + reacquire_controller.py   (_run_reacquire khi LOST)";
+    fontsize=13; fontcolor="#ff9aa2"; color="#5a2326"; style="rounded,filled"; fillcolor="#150c0d"; penwidth=2;
+
+    r1 [label="① proposal.detect(frame)\nYOLO toàn khung · lọc theo class/label\n(reacquire.match_label)", fillcolor="#241315"];
+    r2 [label="② Refine SAM2 top-N candidate", fillcolor="#241315"];
+    r3 [label="③ ReAcquireEngine.rank()\nreid = w_id·identity + w_mo·motion\n+ w_det·detector + w_mask·mask\n(weights đổi theo lost_age)", fillcolor="#241315"];
+    r4 [label="④ ConfirmationBuffer.attempt()\nIoU ≥ gate  HOẶC  center-dist  HOẶC  reid ≥ 0.85\nstreak ≥ confirm_frames", shape=diamond, fillcolor="#2a1316", fontcolor="#ffb3b3", height=1.0];
+    r5 [label="⑤ Re-lock: tracker/refind init,\nkalman.reset, confidence.on_lock\n→ REACQUIRED → LOCKED", fillcolor="#16314f", fontcolor="#bfe0ff"];
+
+    r1 -> r2 -> r3 -> r4;
+    r4 -> r5 [label="confirmed"];
+    r4 -> r1 [label="chưa đủ → detect_hz\n(3 Hz → 1 Hz khi lost lâu)", style=dashed, color="#7a3030", constraint=false];
+  }
+
+  d_lost -> r1 [lhead=cluster_reacq, label="run_detection"];
+  drm -> r3 [style=dotted, color="#3a8f5f", label="neo danh tính (DRM+WRM)", constraint=false];
+
+  /* ===================== OUTPUT ===================== */
+  out [label="snapshot(include_frame=True)\nJPEG b64 + bbox + kalman_bbox + mask +\ncandidates + metrics + memory + logs", shape=parallelogram, fillcolor="#241a0e", fontcolor="#ffcf8f"];
+  metrics [label="metrics.py · FPS · latency · track_score ·\nconfidence · similarity · kalman_error · motion", shape=parallelogram, fillcolor="#1a130a", fontcolor="#ffcf8f"];
+
+  d_stable -> out [color="#3a8f7f"];
+  gate -> out [style=invis];
+  r5 -> out [color="#5b7089", constraint=false];
+  p7 -> metrics [style=dotted, color="#7a6a2a", constraint=false];
+  out -> ws_out;
+  ws_out [label="◀── WebSocket  /ws/session  ──▶  Frontend (CameraViewport overlay + RightPanel)", shape=box, style="rounded,filled,bold", fillcolor="#102033", fontcolor="#7fd1ff", penwidth=2];
+  metrics -> ws_out [style=dotted, color="#7a6a2a"];
+}

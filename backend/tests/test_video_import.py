@@ -37,6 +37,21 @@ def test_open_marks_file_and_paces_to_fps(tmp_path):
         cam.close()
 
 
+def test_uncap_fps_disables_file_pacing(tmp_path):
+    # With uncap_fps the file is no longer paced to its native FPS: the interval
+    # drops to 0 so the loop runs at the pipeline's full throughput (benchmark).
+    clip = tmp_path / "clip.avi"
+    _write_clip(clip, frames=5, fps=30)
+
+    cam = CameraSource({"camera": {"uncap_fps": True}})
+    assert cam.open(str(clip)) is True
+    try:
+        assert cam._is_file is True
+        assert cam._frame_interval == 0.0
+    finally:
+        cam.close()
+
+
 def test_file_playback_loops_past_end(tmp_path):
     # Only 4 frames, but reading well beyond that must keep yielding frames
     # because the reader rewinds to the start instead of failing.
