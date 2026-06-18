@@ -161,6 +161,62 @@ def test_fallback_drift_drops_state_and_freezes_memory():
     assert sess.memory.admitted_count == before  # drifted crop never poisons memory
 
 
+def test_backbone_instance_reused_across_locks():
+    """Re-locking must REUSE the same backbone instead of rebuilding it: that
+    rebuild (weights + CUDA/ONNX session) is the transition freeze we removed."""
+    sess = _locked_session()
+    first = sess.tracker
+    assert first is not None
+    sess.reset_tracking()
+    sess.frame = _frame()
+    sess.learning_bbox = BBOX
+    sess._finalize_lock(sess.frame)
+    assert sess.tracker is first  # same ManagedTracker re-seeded via reinit
+
+
+def test_backbone_reused_after_reacquire_relock():
+    sess = _locked_session()
+    first = sess.tracker
+    sess.state = TrackingState.SEARCHING
+    sess.reacq.reset()
+    sess.frame = _frame()
+    sess.proposal.detect = lambda frame: [{"bbox": list(BBOX), "score": 0.9}]
+    for _ in range(12):
+        sess._run_reacquire(force=True)
+        if sess.state == TrackingState.LOCKED_TRACKING:
+            break
+    assert sess.state == TrackingState.LOCKED_TRACKING
+    assert sess.tracker is first  # re-acquire re-seeded the same backbone
+
+
+def test_reset_tracking_keeps_warm_tracker():
+    sess = _locked_session()
+    first = sess.tracker
+    sess.reset_tracking()
+    assert sess.tracker is first
+    assert sess.tracker.last_bbox is None
+
+
+def test_patch_config_rebuilds_only_on_backbone_change():
+    sess = TrackingSession()
+    first = sess.tracker
+    sess.patch_config({"thresholds": {"stable_threshold": 0.6}})
+    assert sess.tracker is first  # unrelated patch keeps the warm instance
+    sess.patch_config({"tracking": {"normal_backbone": "opencv"}})
+    assert sess.tracker is not first  # backbone name change forces a rebuild
+    assert (sess.tracker.requested or "").lower() == "opencv"
+
+
+def test_teardown_on_stop_frees_tracker_and_snapshot_is_safe():
+    sess = TrackingSession()
+    sess.config.setdefault("tracking", {})["teardown_on_stop"] = True
+    snap = sess.stop_camera()  # teardown branch -> tracker None; snapshot must not crash
+    assert sess.tracker is None
+    assert snap["tracking"]["normal_backbone"] == "none"
+    assert snap["tracking"]["tracker_fallback"] is False
+    assert sess._ensure_tracker() is not None  # rebuilds on demand for the next lock
+
+
 def test_reid_cadence_skips_deep_between_intervals():
     """P3: with reid_interval>1 the deep identity score runs only on cadence frames
     (reid_on_uncertain off here to isolate the cadence from state dynamics)."""

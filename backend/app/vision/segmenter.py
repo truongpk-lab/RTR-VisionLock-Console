@@ -81,6 +81,21 @@ class PromptableSegmenter:
     def ready_model(self) -> bool:
         return self.backend in {"sam2", "sam_onnx"}
 
+    def warmup(self, frame_shape: tuple[int, int]) -> None:
+        """Run one dummy refine so the SAM2 encoder builds before the first lock."""
+        if getattr(self, "_warmed", False) or not self.ready_model:
+            self._warmed = True
+            return
+        self._warmed = True
+        try:  # pragma: no cover - depends on deployment runtime
+            h = max(64, int(frame_shape[0]))
+            w = max(64, int(frame_shape[1]))
+            black = np.zeros((h, w, 3), dtype=np.uint8)
+            cx, cy = w // 2, h // 2
+            self.refine_box(black, (cx - 30, cy - 30, 60, 60), positive_point=(cx, cy))
+        except Exception:
+            pass
+
     def _init_sam2(self, seg_cfg: dict[str, Any]) -> bool:
         if build_sam2 is None or SAM2ImagePredictor is None or torch is None:
             self.last_error = "sam2/torch package is not installed"
@@ -162,10 +177,55 @@ class PromptableSegmenter:
             result = self._refine_sam2(frame, bbox, positive_point, negative_boxes or [], motion_bbox)
             if result is not None:
                 return result
+        return self._refine_grabcut_result(frame, bbox, negative_boxes or [])
+
+    def refine_boxes(self, frame: np.ndarray, items: list[dict]) -> list[SegmentResult | None]:
+        """Refine several boxes sharing ONE SAM2 image encode for the whole frame.
+
+        ``set_image`` (the heavy ViT encode) runs once; ``predict`` is then called per
+        box-prompt reusing that embedding. Non-SAM2 backends have no shared encode to
+        amortise, so they fall back to per-item :meth:`refine_box`. Each ``item`` is a
+        dict with ``bbox`` and optional ``positive_point`` / ``negative_boxes`` /
+        ``motion_bbox``. Results are aligned with ``items``.
+        """
+        if cv2 is None or frame is None:
+            return [None for _ in items]
+        if not (self.backend == "sam2" and self.sam2_predictor is not None):
+            return [
+                self.refine_box(
+                    frame, it["bbox"], it.get("positive_point"), it.get("negative_boxes"), it.get("motion_bbox")
+                )
+                for it in items
+            ]
+        height, width = frame.shape[:2]
+        image_set = False
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            self.sam2_predictor.set_image(rgb)  # ONCE — predict() below reuses the embedding
+            image_set = True
+        except Exception as exc:  # pragma: no cover - depends on deployment runtime
+            self.last_error = str(exc)
+        results: list[SegmentResult | None] = []
+        for it in items:
+            bbox = clamp_bbox(tuple(it["bbox"]), width, height)
+            negatives = it.get("negative_boxes") or []
+            result = (
+                self._predict_prompt(frame, bbox, it.get("positive_point"), negatives, it.get("motion_bbox"))
+                if image_set
+                else None
+            )
+            if result is None:
+                result = self._refine_grabcut_result(frame, bbox, negatives)
+            results.append(result)
+        return results
+
+    def _refine_grabcut_result(self, frame: np.ndarray, bbox: BBox, negative_boxes: list[BBox]) -> SegmentResult:
+        """GrabCut fallback tail shared by refine_box / refine_boxes."""
+        height, width = frame.shape[:2]
         refined = self._refine_grabcut_box(frame, bbox)
         if refined is None:
             return SegmentResult(bbox=bbox, quality=0.0, backend=self.backend, refined=False)
-        if self._overlaps_distractor(refined, negative_boxes or []):
+        if self._overlaps_distractor(refined, negative_boxes):
             return SegmentResult(bbox=bbox, quality=0.0, backend=self.backend, refined=False)
         quality = bbox_iou(bbox, refined)
         return SegmentResult(bbox=clamp_bbox(refined, width, height), quality=quality, backend=self.backend, refined=refined != bbox)
@@ -179,10 +239,25 @@ class PromptableSegmenter:
         motion_bbox: BBox | None = None,
     ) -> SegmentResult | None:
         try:
-            height, width = frame.shape[:2]
-            x, y, w, h = clamp_bbox(bbox, width, height)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             self.sam2_predictor.set_image(rgb)
+        except Exception as exc:  # pragma: no cover - depends on deployment runtime
+            self.last_error = str(exc)
+            return None
+        return self._predict_prompt(frame, bbox, positive_point, negative_boxes, motion_bbox)
+
+    def _predict_prompt(
+        self,
+        frame: np.ndarray,
+        bbox: BBox,
+        positive_point: tuple[int, int] | None,
+        negative_boxes: list[BBox],
+        motion_bbox: BBox | None = None,
+    ) -> SegmentResult | None:
+        """SAM2 box/point prediction on the ALREADY-set image -> motion-aware result."""
+        try:
+            height, width = frame.shape[:2]
+            x, y, w, h = clamp_bbox(bbox, width, height)
             box = np.array([x, y, x + w, y + h], dtype=np.float32)
             point_coords, point_labels = self._prompt_points((x, y, w, h), positive_point, negative_boxes)
             masks, scores, _ = self.sam2_predictor.predict(

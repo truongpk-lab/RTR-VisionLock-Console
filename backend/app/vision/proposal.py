@@ -129,6 +129,18 @@ class YoloProposalDetector:
     def ready_model(self) -> bool:
         return self.model is not None
 
+    def warmup(self, frame_shape: tuple[int, int]) -> None:
+        """Run one dummy detect so the YOLO/TensorRT engine builds before first use."""
+        if getattr(self, "_warmed", False) or self.model is None:
+            self._warmed = True
+            return
+        self._warmed = True
+        try:  # pragma: no cover - depends on deployment runtime
+            h, w = int(frame_shape[0]), int(frame_shape[1])
+            self.detect(np.zeros((max(16, h), max(16, w), 3), dtype=np.uint8))
+        except Exception:
+            pass
+
     def detect(self, frame: np.ndarray) -> list[dict]:
         if self.model is None:
             return self.fallback.detect(frame)

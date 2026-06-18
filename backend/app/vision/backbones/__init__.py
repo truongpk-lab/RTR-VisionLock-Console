@@ -50,6 +50,7 @@ class ManagedTracker:
         self.requested = backbone
         self.backbone = self._build()
         self.last_bbox: BBox | None = None
+        self._warmed = False
 
     def _build(self) -> TrackerBackbone:
         name = self.requested or _resolve_default_name(self.config)
@@ -58,6 +59,10 @@ class ManagedTracker:
             return backbone
         # Requested engine could not load -> universal OpenCV fallback.
         return OpenCvBackbone(self.config)
+
+    def _wants_deep(self) -> bool:
+        """A non-opencv backbone was explicitly requested."""
+        return (self.requested or "").lower() not in ("", "opencv")
 
     @property
     def kind(self) -> str:
@@ -111,6 +116,69 @@ class ManagedTracker:
                 if result.ok and result.bbox is not None:
                     self.last_bbox = result.bbox
         return result
+
+    def reinit(self, frame: np.ndarray, bbox: BBox, *, try_recover_deep: bool = True) -> bool:
+        """Re-seed the EXISTING backbone on a new bbox without rebuilding the network.
+
+        This is the hot path for every (re)lock: a deep tracker's ``initialize`` is
+        cheap (~ms), while rebuilding it reloads weights and a CUDA/ONNX session
+        (hundreds of ms). So we keep one backbone alive and only re-seed it.
+
+        One exception: if the backbone silently dropped to OpenCV mid-stream (a
+        transient deep failure) and a deep engine was requested, we try ONE rebuild
+        here so the deep tracker can recover. If that rebuild also fails we keep the
+        OpenCV fallback, so behaviour never regresses.
+        """
+        recover = try_recover_deep and bool(
+            self.config.get("tracking", {}).get("recover_deep_on_relock", True)
+        )
+        if recover and self._is_fallback() and self._wants_deep():
+            rebuilt = self._build()
+            if getattr(rebuilt, "available", True) and rebuilt.init(frame, bbox):
+                self.backbone = rebuilt
+                self.last_bbox = clamp_bbox(bbox, frame.shape[1], frame.shape[0])
+                self._warmed = True  # the recovery init already paid the first-call cost
+                return True
+            # Rebuild unavailable / failed -> fall through to re-seed the OpenCV fallback.
+        return self.init(frame, bbox)
+
+    def warmup(self, frame_shape: tuple[int, int]) -> None:
+        """Run ONE dummy init+track to build the engine / init CUDA before the user locks.
+
+        Idempotent and never raises: a deep backbone's first inference builds the
+        TensorRT engine and initialises the CUDA context, which is what otherwise
+        stalls the first real lock. OpenCV / torch-less boxes are a cheap no-op.
+        """
+        if self._warmed:
+            return
+        self._warmed = True
+        if self._is_fallback():  # OpenCV: nothing heavy to warm
+            return
+        try:
+            h, w = int(frame_shape[0]), int(frame_shape[1])
+            if h < 16 or w < 16:
+                return
+            dummy = np.zeros((h, w, 3), dtype=np.uint8)
+            bbox = (w // 2 - 20, h // 2 - 20, 40, 40)
+            if self.backbone.init(dummy, bbox):
+                self.backbone.track(dummy)  # force a real forward -> builds the engine
+        except Exception:  # pragma: no cover - warmup must never break start
+            pass
+        finally:
+            self.last_bbox = None  # discard the dummy seed so the real lock re-seeds clean
+
+    def close(self) -> None:
+        """Drop the backbone and free GPU memory (best-effort) on a hard stop."""
+        self.backbone = None
+        self.last_bbox = None
+        self._warmed = False
+        try:  # pragma: no cover - depends on deployment runtime
+            import torch
+
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def to_dict(self) -> dict:
         info = {

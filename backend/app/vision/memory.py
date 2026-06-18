@@ -59,6 +59,13 @@ class MemoryBank:
         self.drm: deque[np.ndarray] = deque(maxlen=self.drm_slots)
         self.negative: deque[np.ndarray] = deque(maxlen=self.negative_slots)
 
+        # Per-tick feature memo. During one re-detect tick the SAME (frame, bbox) is
+        # encoded by score()/anchor_score()/rank()/gate() several times; the feature
+        # only depends on (frame, bbox), so we cache it for the tick. Disabled (token
+        # None) outside a tick, so the live tracking path always re-encodes.
+        self._feat_cache: dict[tuple[int, tuple[int, int, int, int]], np.ndarray | None] = {}
+        self._feat_cache_token: Any = None
+
     def configure(self, config: dict[str, Any]) -> None:
         """Apply config-tunable thresholds and bank sizes live (Memory Config UI).
 
@@ -84,6 +91,45 @@ class MemoryBank:
 
     def extract(self, frame: np.ndarray, bbox: BBox, mask: np.ndarray | None = None) -> np.ndarray | None:
         return self.encoder.extract(frame, bbox, mask)
+
+    def begin_tick(self, token: Any) -> None:
+        """Open a feature-cache scope for one re-detect tick.
+
+        ``token`` must be the live frame object so its ``id`` cannot be reused for a
+        different array while the tick runs (the caller keeps a reference). A new
+        token clears the cache; the same token re-opens onto the existing cache.
+        """
+        if token is not self._feat_cache_token:
+            self._feat_cache.clear()
+            self._feat_cache_token = token
+
+    def end_tick(self) -> None:
+        """Close the cache scope and release the cached features."""
+        self._feat_cache.clear()
+        self._feat_cache_token = None
+
+    def _extract_cached(self, frame: np.ndarray, bbox: BBox) -> np.ndarray | None:
+        """Encode (frame, bbox) once per tick; outside a tick this just calls extract."""
+        if self._feat_cache_token is None or frame is not self._feat_cache_token:
+            return self.extract(frame, bbox)
+        key = (id(frame), tuple(int(v) for v in bbox))
+        if key not in self._feat_cache:
+            self._feat_cache[key] = self.extract(frame, bbox)
+        return self._feat_cache[key]
+
+    def warmup(self, frame_shape: tuple[int, int]) -> None:
+        """Run one dummy encode so the (deep ONNX) ReID session builds up front."""
+        if getattr(self, "_warmed", False):
+            return
+        self._warmed = True
+        try:  # pragma: no cover - depends on deployment runtime
+            h = max(32, int(frame_shape[0]))
+            w = max(32, int(frame_shape[1]))
+            black = np.zeros((h, w, 3), dtype=np.uint8)
+            cx, cy = w // 2, h // 2
+            self.extract(black, (cx - 20, cy - 20, 40, 40))
+        except Exception:
+            pass
 
     def initialize(self, frame: np.ndarray, bbox: BBox) -> bool:
         feature = self.extract(frame, bbox)
@@ -198,7 +244,7 @@ class MemoryBank:
         """Live identity score vs short + long-term memory (ram + drm)."""
         if not self.ram:
             return self._zero_scores()
-        feature = self.extract(frame, bbox)
+        feature = self._extract_cached(frame, bbox)
         if feature is None:
             return self._zero_scores()
         return self._identity(feature, list(self.ram) + list(self.drm))
@@ -213,7 +259,7 @@ class MemoryBank:
         anchor = list(self.drm) + list(self.wrm)
         if not anchor:
             return self._zero_scores()
-        feature = self.extract(frame, bbox)
+        feature = self._extract_cached(frame, bbox)
         if feature is None:
             return self._zero_scores()
         return self._identity(feature, anchor)

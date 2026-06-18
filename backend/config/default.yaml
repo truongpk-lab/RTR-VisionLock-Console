@@ -151,6 +151,14 @@ tracking:
   #   confidence HIGH/LOW -> normal_backbone (Tier A, local track; re-searches itself)
   #   target LOST         -> global YOLO+ReID re-detect (Tier C, reacquire_threshold)
   normal_backbone: uetrack
+  # The deep backbone is built ONCE and re-seeded on every (re)lock (no rebuild ->
+  # no transition freeze). If it ever drops to the OpenCV fallback mid-stream, the
+  # next re-lock tries one rebuild to recover the deep tracker. Set false to stay on
+  # OpenCV after a drop (avoids repeated rebuild cost if the deep engine is broken).
+  recover_deep_on_relock: true
+  # Free GPU memory when the camera stops by tearing the backbone down. Default keeps
+  # it warm so the next start + lock has no engine-build stall.
+  teardown_on_stop: false
 
 motion:
   # Camera ego-motion compensation: sparse LK optical flow on background features

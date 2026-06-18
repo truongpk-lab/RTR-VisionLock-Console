@@ -1,3 +1,5 @@
+import numpy as np
+
 from app.vision.backbones import BACKBONE_REGISTRY, ManagedTracker, build_backbone
 
 
@@ -42,3 +44,31 @@ def test_managed_tracker_default_backbone_is_opencv():
     assert tracker.source == "opencv"
     info = tracker.to_dict()
     assert info["requested"] == "auto"
+
+
+def test_reinit_reseeds_without_crashing():
+    # reinit re-seeds the existing tracker for every (re)lock. On a torch-less box
+    # the deep request runs as the OpenCV fallback (cv2's init returns None -> a
+    # falsey bool, which the lock flow tolerates); reinit must just not raise and
+    # keep the fallback running.
+    tracker = ManagedTracker({}, backbone="uetrack")
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    frame[50:90, 50:90] = (60, 200, 240)
+    r1 = tracker.reinit(frame, (50, 50, 40, 40))
+    r2 = tracker.reinit(frame, (60, 60, 40, 40))  # second re-seed
+    assert isinstance(r1, bool) and isinstance(r2, bool)
+    assert tracker.source == "opencv"
+
+
+def test_warmup_is_noop_without_torch():
+    tracker = ManagedTracker({}, backbone="uetrack")
+    tracker.warmup((480, 640))  # must never raise
+    assert tracker._warmed is True
+    assert tracker.source == "opencv"
+    tracker.warmup((480, 640))  # idempotent
+
+
+def test_close_releases_backbone():
+    tracker = ManagedTracker({}, backbone="uetrack")
+    tracker.close()  # must never raise even without torch/CUDA
+    assert tracker.backbone is None

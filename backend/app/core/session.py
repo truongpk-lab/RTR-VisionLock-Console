@@ -109,6 +109,19 @@ class TrackingSession:
         name = self.config.get("tracking", {}).get("normal_backbone", "uetrack")
         return ManagedTracker(self.config, backbone=name)
 
+    def _ensure_tracker(self) -> ManagedTracker:
+        """Return the live Tier A tracker, rebuilding only when the backbone changed.
+
+        The deep backbone is expensive to construct (weights + CUDA/ONNX session),
+        so every (re)lock re-seeds this single instance via ``reinit`` instead of
+        rebuilding it. We only build a fresh one when it was torn down (stop) or the
+        configured ``normal_backbone`` name actually changed.
+        """
+        name = self.config.get("tracking", {}).get("normal_backbone", "uetrack")
+        if self.tracker is None or (self.tracker.requested or "").lower() != str(name).lower():
+            self.tracker = self._new_normal_tracker()
+        return self.tracker
+
     def _log_tracker_backend(self, tracker: ManagedTracker, tier: str) -> None:
         """Surface which engine actually drives the lock; warn on silent fallback.
 
@@ -142,7 +155,33 @@ class TrackingSession:
             self.log("Camera", "INFO", "Camera started.")
             self._thread = threading.Thread(target=self._loop, name="visionlock-camera", daemon=True)
             self._thread.start()
+            self._warmup_async()
             return self.snapshot(include_frame=False)
+
+    def _warmup_async(self) -> None:
+        """Build the deep engines (tracker/YOLO/SAM2/ReID) off the critical path.
+
+        The first inference of each heavy model lazily builds a TensorRT engine and
+        initialises CUDA, which otherwise stalls the user's first lock/detect. Doing
+        it on a daemon thread right after camera start hides that cost: the operator
+        needs a few seconds to pick a target, and tracker.track() is not called until
+        a lock exists, so warming the tracker here cannot race the processing loop.
+        """
+        cam = self.config.get("camera", {})
+        shape = (int(cam.get("height", 720)), int(cam.get("width", 1280)))
+
+        def run() -> None:
+            try:
+                self._ensure_tracker().warmup(shape)
+                for component in (self.proposal, self.segmenter, self.memory):
+                    warm = getattr(component, "warmup", None)
+                    if callable(warm):
+                        warm(shape)
+                self.log("Core", "INFO", "Warmup complete; engines ready.")
+            except Exception as exc:  # pragma: no cover - warmup must never break start
+                self.log("Core", "WARN", f"Warmup skipped: {exc}")
+
+        threading.Thread(target=run, name="visionlock-warmup", daemon=True).start()
 
     def stop_camera(self) -> dict:
         self._stop.set()
@@ -156,7 +195,14 @@ class TrackingSession:
             self.kalman_bbox = None
             self.candidates = []
             self._clear_selection_state()
-            self.tracker = self._new_normal_tracker()
+            # Stop is the one place we may free VRAM: teardown_on_stop=true drops the
+            # backbone, otherwise keep it warm so the next start+lock has no stall.
+            if self.config.get("tracking", {}).get("teardown_on_stop", False):
+                if self.tracker is not None:
+                    self.tracker.close()
+                self.tracker = None
+            elif self.tracker is not None:
+                self.tracker.last_bbox = None
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
@@ -293,7 +339,12 @@ class TrackingSession:
 
     def reset_tracking(self) -> dict:
         with self._lock:
-            self.tracker = self._new_normal_tracker()
+            # Keep the (warm) backbone; just forget the last box so a stale bbox can
+            # never drive a recovery. The next lock re-seeds it via reinit.
+            if self.tracker is not None:
+                self.tracker.last_bbox = None
+            else:
+                self.tracker = self._new_normal_tracker()
             self.confidence.reset()
             self.reacq.reset()
             self.camera_motion.reset()
@@ -332,6 +383,7 @@ class TrackingSession:
 
     def patch_config(self, patch: dict[str, Any]) -> dict:
         with self._lock:
+            prev_backbone = self.config.get("tracking", {}).get("normal_backbone", "uetrack")
             self.config = deep_merge(self.config, patch)
             self.proposal = build_proposal_detector(self.config)
             self.segmenter = PromptableSegmenter(self.config)
@@ -340,6 +392,15 @@ class TrackingSession:
             self.reacq.configure(self.config)
             self.memory.configure(self.config)
             self.camera_motion = CameraMotionEstimator(self.config)
+            # Only rebuild the tracker when the backbone NAME changed (expensive). For
+            # any other patch, just hand it the new config. NOTE: editing
+            # models.tracker_<name>.* (e.g. checkpoint) without changing the backbone
+            # name applies at the next backbone switch / reset, not here.
+            new_backbone = self.config.get("tracking", {}).get("normal_backbone", "uetrack")
+            if str(new_backbone).lower() != str(prev_backbone).lower():
+                self.tracker = self._new_normal_tracker()
+            elif self.tracker is not None:
+                self.tracker.config = self.config
             self.log("Core", "INFO", "Runtime config patched.")
             return self.config
 
@@ -649,8 +710,10 @@ class TrackingSession:
             return
         height, width = frame.shape[:2]
         bbox = clamp_bbox(bbox, width, height)
-        self.tracker = self._new_normal_tracker()
-        ok = self.tracker.init(frame, bbox)
+        # Re-seed the existing backbone instead of rebuilding it: a fresh deep
+        # tracker would reload weights + a CUDA/ONNX session and freeze the lock
+        # transition for hundreds of ms.
+        ok = self._ensure_tracker().reinit(frame, bbox)
         self.confidence.on_lock()
         self.reacq.reset()
         self.camera_motion.reset()
@@ -903,16 +966,26 @@ class TrackingSession:
             # confirmation buffer advances per detection tick, not per camera frame).
             if not force and not self._reacquire_due():
                 return
-            detections = self._filter_by_target_class(self.proposal.detect(self.frame))
-            candidates = self._enrich_candidates(self.frame, detections)
-            candidates = self._refine_reacquire_candidates(self.frame, candidates)
-            candidates = self._enrich_candidates(self.frame, candidates)
-            self.candidates = candidates
-            self.metrics.candidates = len(candidates)
-            if self._lost_since is None:
-                self._lost_since = time.monotonic()
-            lost_age = time.monotonic() - self._lost_since
-            outcome = self.reacq.attempt(self.frame, candidates, lost_age)
+            # One feature-cache scope for the whole tick: score/anchor_score/rank/gate
+            # all hit the same (frame, bbox), so each candidate is encoded once.
+            self.memory.begin_tick(self.frame)
+            try:
+                detections = self._filter_by_target_class(self.proposal.detect(self.frame))
+                # Normalize (cheap, no encode) so refine has ids/class, then SAM2 refine
+                # the top-k bbox, then enrich ONCE on the final boxes. Identity/motion
+                # reflect the refined box and each candidate is encoded a single time
+                # (the old enrich -> refine -> enrich did a full re-encode pass).
+                normalized = [self._normalize_candidate(c, idx) for idx, c in enumerate(detections)]
+                candidates = self._refine_reacquire_candidates(self.frame, normalized)
+                candidates = self._enrich_candidates(self.frame, candidates)
+                self.candidates = candidates
+                self.metrics.candidates = len(candidates)
+                if self._lost_since is None:
+                    self._lost_since = time.monotonic()
+                lost_age = time.monotonic() - self._lost_since
+                outcome = self.reacq.attempt(self.frame, candidates, lost_age)
+            finally:
+                self.memory.end_tick()
             self._reacquire_score = outcome.reid_score
             if outcome.candidate is not None:
                 self.metrics.similarity = float(outcome.candidate.get("similarity", self.metrics.similarity))
@@ -927,8 +1000,7 @@ class TrackingSession:
                 return
             # Confirmed over enough consecutive detections -> commit the re-lock.
             bbox = tuple(outcome.bbox)
-            self.tracker = self._new_normal_tracker()
-            self.tracker.init(self.frame, bbox)
+            self._ensure_tracker().reinit(self.frame, bbox)
             self._log_tracker_backend(self.tracker, "Tier A normal")
             self.confidence.on_lock()
             self.reacq.reset()
@@ -954,19 +1026,25 @@ class TrackingSession:
         if max_refine == 0:
             return candidates
         ranked = sorted(candidates, key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        refine_ids = {item["id"] for item in ranked[:max_refine]}
+        refine_ids = [item["id"] for item in ranked[:max_refine]]
+        by_id = {candidate["id"]: candidate for candidate in candidates}
+        # One batch -> SAM2 encodes the frame ONCE and predicts every top-k box prompt
+        # off the shared embedding, instead of re-encoding per candidate.
+        motion_bbox = self.kalman.predict()
+        items = [
+            {
+                "bbox": tuple(by_id[cid]["bbox"]),
+                "positive_point": tuple(int(v) for v in bbox_center(tuple(by_id[cid]["bbox"]))),
+                "negative_boxes": self._candidate_distractor_boxes(by_id[cid], candidates),
+                "motion_bbox": motion_bbox,
+            }
+            for cid in refine_ids
+        ]
+        results = self.segmenter.refine_boxes(frame, items)
+        refined_by_id = {cid: result for cid, result in zip(refine_ids, results) if result is not None}
         refined_candidates = []
         for candidate in candidates:
-            if candidate["id"] not in refine_ids:
-                refined_candidates.append(candidate)
-                continue
-            result = self.segmenter.refine_box(
-                frame,
-                tuple(candidate["bbox"]),
-                positive_point=tuple(int(v) for v in bbox_center(tuple(candidate["bbox"]))),
-                negative_boxes=self._candidate_distractor_boxes(candidate, candidates),
-                motion_bbox=self.kalman.predict(),
-            )
+            result = refined_by_id.get(candidate["id"])
             if result is None:
                 refined_candidates.append(candidate)
                 continue
@@ -999,6 +1077,8 @@ class TrackingSession:
 
     def snapshot(self, include_frame: bool = True) -> dict:
         with self._lock:
+            # self.tracker is None only after a teardown_on_stop stop (no live engine).
+            tracker = self.tracker
             return {
                 "app": self.config.get("app", {}).get("name", "RTR VisionLock Console"),
                 "state": self.state.value,
@@ -1019,11 +1099,11 @@ class TrackingSession:
                 },
                 "proposal": self.proposal.to_dict() if hasattr(self.proposal, "to_dict") else {"backend": "unknown"},
                 "segmenter": self.segmenter.to_dict(),
-                "tracker": self.tracker.to_dict() if hasattr(self.tracker, "to_dict") else {"source": "unknown"},
+                "tracker": tracker.to_dict() if hasattr(tracker, "to_dict") else {"source": "unknown"},
                 "tracking": {
                     "confidence_state": self.confidence.confidence_state,
-                    "normal_backbone": self.tracker.source,
-                    "tracker_fallback": self.tracker.is_fallback,
+                    "normal_backbone": tracker.source if tracker is not None else "none",
+                    "tracker_fallback": tracker.is_fallback if tracker is not None else False,
                     "reacquire": {
                         "confirming": self.reacq.confirming,
                         "need": self.reacq.confirm_frames,
@@ -1045,9 +1125,10 @@ class TrackingSession:
         computed signals (no extra detection/scoring).
         """
         identity = self._last_identity or {}
+        tracker = self.tracker
         return {
-            "tracker_backend": self.tracker.source,
-            "tracker_fallback": self.tracker.is_fallback,
+            "tracker_backend": tracker.source if tracker is not None else "none",
+            "tracker_fallback": tracker.is_fallback if tracker is not None else False,
             "proposal_source": self._proposal_source,
             "lost_age_sec": round(time.monotonic() - self._lost_since, 2) if self._lost_since else 0.0,
             "negative_similarity": float(identity.get("negative_similarity", 0.0)),
