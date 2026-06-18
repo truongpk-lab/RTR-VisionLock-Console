@@ -15,7 +15,7 @@ export function ReacquireConfig() {
             { path: ["reacquire", "detect_hz"], label: "Detect Hz", min: 1, max: 10, step: 1, hint: "Tần suất chạy YOLO toàn khung khi LOST" },
             { path: ["reacquire", "confirm_frames"], label: "Confirm frames", min: 1, max: 8, step: 1, hint: "Số lần xác nhận liên tiếp trước khi re-lock" },
             { path: ["reacquire", "confirm_iou_gate"], label: "Confirm IoU gate", min: 0.0, max: 0.8, step: 0.01 },
-            { path: ["reacquire", "reacquire_threshold"], label: "Re-acquire threshold", min: 0.3, max: 0.95, step: 0.01 },
+            { path: ["thresholds", "reacquire_threshold"], label: "Re-acquire threshold", min: 0.3, max: 0.95, step: 0.01, hint: "reid tối thiểu để re-lock khi LOST (cao = chắc hơn, re-lock chậm hơn)" },
             { path: ["reacquire", "top_k"], label: "Top-K hypotheses", min: 1, max: 4, step: 1 },
           ],
         },

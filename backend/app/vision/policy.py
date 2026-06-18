@@ -44,6 +44,11 @@ class TrackingPolicy:
         self.stable = float(thresholds.get("stable_threshold", 0.70))
         self.uncertain = float(thresholds.get("uncertain_threshold", 0.45))
         self.lost_frames = int(thresholds.get("lost_frames", 5))
+        # Schmitt-trigger hysteresis on STABLE: enter at `stable`, only leave once the
+        # score drops below `stable - stable_hysteresis`. Stops STABLE<->UNCERTAIN
+        # flapping when the score hovers at the band edge. 0 = hard threshold (old
+        # behaviour, unit-tested).
+        self.stable_hysteresis = max(0.0, float(thresholds.get("stable_hysteresis", 0.0)))
         # Consecutive ok-but-low-identity frames (tracker still ok, but on the wrong
         # object) inside UNCERTAIN before forcing LOST -> global re-detect. Larger
         # than lost_frames: this is a soft "tracking-something-wrong" loss, so we are
@@ -54,6 +59,7 @@ class TrackingPolicy:
         """Called on every fresh lock / successful re-acquire."""
         self.lost_count = 0  # frames clearly below the uncertain band
         self.identity_lost_count = 0  # consecutive ok frames with low identity
+        self.in_stable = False  # Schmitt-trigger state for the STABLE hysteresis
 
     # Read alias for intent at call sites.
     def on_lock(self) -> None:
@@ -67,10 +73,15 @@ class TrackingPolicy:
         else:
             self.identity_lost_count = 0
 
-        # Tier A: solid frame -> stable local tracking.
-        if ok and score >= self.stable:
+        # Tier A: solid frame -> stable local tracking. Hysteresis: once STABLE, hold
+        # it until the score falls below `stable - stable_hysteresis`, so a score
+        # bouncing around the threshold does not flap STABLE<->UNCERTAIN.
+        stable_gate = self.stable - self.stable_hysteresis if self.in_stable else self.stable
+        if ok and score >= stable_gate:
+            self.in_stable = True
             self.lost_count = 0
             return PolicyDecision(TrackingState.STABLE, False)
+        self.in_stable = False
 
         # Tier A: drifting but still plausibly on target -> keep tracking locally.
         if ok and score >= self.uncertain:

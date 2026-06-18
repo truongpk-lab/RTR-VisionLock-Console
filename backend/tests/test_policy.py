@@ -75,6 +75,26 @@ def test_identity_lost_streak_resets_on_recovered_identity():
     assert all(not d.reacquire for d in follow)  # needs a fresh full streak
 
 
+def test_stable_hysteresis_holds_through_dips():
+    # Once STABLE, a score dipping below stable_threshold (0.70) but above the exit
+    # gate (0.70 - 0.10 = 0.60) must STAY STABLE -- no flapping at the band edge.
+    policy = _policy(stable_hysteresis=0.10)
+    assert policy.update(0.80, ok=True).state == TrackingState.STABLE  # enter
+    assert policy.update(0.65, ok=True).state == TrackingState.STABLE  # held by hysteresis
+    assert policy.update(0.62, ok=True).state == TrackingState.STABLE
+    # Below the exit gate -> drop to UNCERTAIN.
+    assert policy.update(0.55, ok=True).state == TrackingState.UNCERTAIN
+    # Re-entry requires the full stable threshold again (not the lowered exit gate).
+    assert policy.update(0.65, ok=True).state == TrackingState.UNCERTAIN
+    assert policy.update(0.72, ok=True).state == TrackingState.STABLE
+
+
+def test_no_hysteresis_by_default_is_hard_threshold():
+    policy = _policy()  # stable_hysteresis defaults to 0.0
+    assert policy.update(0.80, ok=True).state == TrackingState.STABLE
+    assert policy.update(0.69, ok=True).state == TrackingState.UNCERTAIN  # hard edge
+
+
 def test_reset_clears_counters():
     policy = _policy()
     policy.update(0.0, ok=False)

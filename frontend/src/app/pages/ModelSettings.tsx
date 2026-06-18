@@ -48,7 +48,10 @@ export function ModelSettings() {
           fields: [
             { path: ["runtime", "stream_max_width"], label: "Stream max width", min: 480, max: 1920, step: 20 },
             { path: ["runtime", "stream_jpeg_quality"], label: "Stream JPEG quality", min: 30, max: 95, step: 1 },
-            { path: ["motion", "camera", "flow_interval"], label: "Optical-flow interval", min: 1, max: 5, step: 1 },
+            { path: ["motion", "camera", "enabled"], label: "Camera ego-motion (optical flow)", kind: "bool", hint: "Tắt cho cam TĨNH để tiết kiệm ~14ms/frame (flow là bottleneck FPS)" },
+            { path: ["motion", "camera", "flow_interval"], label: "Optical-flow interval", min: 1, max: 5, step: 1, hint: "Chạy flow mỗi N frame (cao hơn = nhanh hơn, bù rung kém hơn)" },
+            { path: ["motion", "camera", "flow_downscale"], label: "Optical-flow downscale", min: 0.25, max: 1.0, step: 0.05, hint: "Nhỏ hơn = flow rẻ hơn" },
+            { path: ["motion", "camera", "max_features"], label: "Optical-flow max features", min: 50, max: 400, step: 10 },
           ],
         },
       ]}

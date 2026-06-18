@@ -87,6 +87,10 @@ selection:
 
 thresholds:
   stable_threshold: 0.70
+  # Hysteresis on STABLE: once locked STABLE, only drop to UNCERTAIN when the score
+  # falls below stable_threshold - this. Stops STABLE<->UNCERTAIN flapping when the
+  # score hovers near 0.70. 0 = hard threshold (old behaviour).
+  stable_hysteresis: 0.08
   uncertain_threshold: 0.45
   lost_frames: 5
   reacquire_threshold: 0.62
